@@ -4,6 +4,7 @@ A bundle is a zip file covering one or more executions:
 
     manifest.json       what's inside, SHA-256 of every file, audit chain state at export
     manifest.sig        HMAC-SHA256 of manifest.json (only when a signing key is configured)
+    incident.json       the incident record with its alerts (incident bundles only)
     timeline.json       every audit event for the executions, in order, in plain form
     RCA.md              the agent's hypothesis, evidence and confidence, and what was done
     remediation.json    tool, parameters, risk assessment, policy decision, result
@@ -31,11 +32,14 @@ import sys
 import uuid
 import zipfile
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .audit import GENESIS_HASH, AuditEvent, _digest
 from .gateway import Execution, SovereignGateway
 from .models import utcnow
+
+if TYPE_CHECKING:
+    from .incidents import IncidentManager
 
 BUNDLE_FORMAT = "aegis-evidence-bundle/1"
 _FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
@@ -60,8 +64,20 @@ def build_bundle(
     exported_by: str,
     title: str = "",
     signing_key: bytes | None = None,
+    incidents: "IncidentManager | None" = None,
+    incident_id: str | None = None,
 ) -> EvidenceBundle:
-    if not execution_ids:
+    incident = None
+    if incident_id is not None:
+        if incidents is None:
+            raise EvidenceError("incident bundles need an IncidentManager")
+        try:
+            incident = incidents.get(incident_id)
+        except ValueError:
+            raise EvidenceError(f"unknown incident: {incident_id}") from None
+        execution_ids = [*incident.execution_ids, *execution_ids]
+        title = title or f"{incident.incident_id}: {incident.title}"
+    if not execution_ids and incident is None:
         raise EvidenceError("at least one execution_id is required")
     ids = list(dict.fromkeys(execution_ids))  # de-duplicate, keep order
     try:
@@ -70,18 +86,25 @@ def build_bundle(
         raise EvidenceError(f"unknown execution: {exc.args[0]}") from None
 
     id_set = set(ids)
-    events = [e for e in gateway.audit.events() if e.execution_id in id_set]
+    events = [
+        e for e in gateway.audit.events()
+        if e.execution_id in id_set or (incident is not None and e.data.get("incident_id") == incident.incident_id)
+    ]
     all_events = gateway.audit.events()
     bundle_id = f"evb-{uuid.uuid4().hex[:12]}"
 
     files: dict[str, bytes] = {
         "timeline.json": _json([_timeline_entry(e) for e in events]),
-        "RCA.md": _rca(title, executions).encode(),
+        "RCA.md": _rca(title, executions, incident).encode(),
         "remediation.json": _json([_remediation(x) for x in executions]),
         "approvals.json": _json([_approvals(x) for x in executions]),
         "verification.json": _json([_verification(x) for x in executions]),
         "audit.json": _json([asdict(e) for e in events]),
     }
+    if incident is not None:
+        incident_data = asdict(incident)
+        incident_data["status"] = incident.status.value
+        files["incident.json"] = _json(incident_data)
     manifest = {
         "format": BUNDLE_FORMAT,
         "bundle_id": bundle_id,
@@ -89,6 +112,7 @@ def build_bundle(
         "created_at": utcnow().isoformat(),
         "exported_by": exported_by,
         "execution_ids": ids,
+        "incident_id": incident.incident_id if incident else None,
         "files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(files.items())},
         "audit_chain": {
             "valid_at_export": gateway.audit.verify(),
@@ -114,6 +138,7 @@ def build_bundle(
     gateway.audit.record(
         "evidence.exported", exported_by, None,
         bundle_id=bundle_id, sha256=digest, execution_ids=ids, signed=signing_key is not None,
+        **({"incident_id": incident.incident_id} if incident else {}),
     )
     return EvidenceBundle(bundle_id, f"{bundle_id}.zip", content, digest)
 
@@ -229,12 +254,45 @@ def _verification(x: Execution) -> dict[str, Any]:
     }
 
 
+def _md_text(text: str) -> str:
+    return text.strip()
+
+
 def _md_cell(text: Any) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ")
 
 
-def _rca(title: str, executions: list[Execution]) -> str:
+def _rca(title: str, executions: list[Execution], incident=None) -> str:
     lines = [f"# {title or 'Evidence bundle'}", ""]
+    if incident is not None:
+        lines += [
+            "| | |",
+            "|---|---|",
+            f"| Incident | `{incident.incident_id}` |",
+            f"| Status | {incident.status.value} |",
+            f"| Severity | {incident.severity} |",
+            f"| Service | {_md_cell(incident.service or '—')} |",
+            f"| Owner | {_md_cell(incident.owner or '—')} |",
+            f"| First observed | {incident.first_observed} |",
+            f"| Alerts | {len(incident.alerts)} distinct, {sum(a['count'] for a in incident.alerts)} total |",
+            "",
+            "## Root cause",
+            "",
+            _md_text(incident.root_cause) or "_Not yet recorded._",
+            "",
+            "## Impact",
+            "",
+            _md_text(incident.impact) or "_Not yet recorded._",
+            "",
+            "## Resolution",
+            "",
+            _md_text(incident.resolution) or "_Not yet resolved._",
+            "",
+            "## Actions taken",
+            "",
+        ]
+        if not executions:
+            lines += ["_No governed actions were linked to this incident._", ""]
     for x in executions:
         c = x.context
         lines += [

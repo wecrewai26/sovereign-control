@@ -27,6 +27,7 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `api.ControlAPI` | §10, §54 | HTTP API Gateway (humans) and Agent Gateway (agents), plus the Control Tower summary |
 | `persistence.SQLiteStore` | §26, §27 | Durable audit trail, agent identities, executions, approvals and token hashes (standard-library SQLite) |
 | `evidence` | §26, §27 | Evidence bundle export (zip with manifest of SHA-256 hashes, optional HMAC signature) and an offline verifier |
+| `incidents.IncidentManager` | §21, §23, §24 | Incidents that group alerts (de-duplicated by fingerprint) and governed executions, with a status lifecycle and a timeline read from the audit trail |
 | `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
 
 ### HTTP API
@@ -48,6 +49,16 @@ User tokens and agent tokens are kept apart: an agent can't call human endpoints
 | GET | `/v1/approvals` | user | Pending approvals |
 | GET | `/v1/audit[?execution_id=]`, `/v1/audit/verify` | user | Audit trail and hash-chain check |
 | GET | `/v1/evidence?execution_id=…[&execution_id=…][&title=…]` | user | Download an evidence bundle (zip). The export is itself written to the audit trail with the file's SHA-256 |
+| POST | `/v1/agent/incidents` | agent | Open an incident (`detection_source` is recorded as the agent) |
+| GET | `/v1/agent/incidents/{id}` | agent | Incident with timeline |
+| POST | `/v1/agent/incidents/{id}/alerts` | agent | Attach an alert `{name, source, severity, summary, labels, fingerprint}` |
+| POST | `/v1/agent/incidents/{id}/status` | agent | `investigating` or `mitigating` only |
+| GET, POST | `/v1/incidents` | user | List (`?status=&severity=`) or open incidents |
+| GET | `/v1/incidents/{id}` | user | Incident with its full timeline |
+| POST | `/v1/incidents/{id}/alerts`, `/links` | user | Attach an alert; link an execution `{execution_id}` |
+| POST | `/v1/incidents/{id}/status` | user | `{status, note, resolution}`; resolving requires a resolution |
+| POST | `/v1/incidents/{id}/update` | user | `{owner, severity, impact, root_cause, affected_services}` |
+| GET | `/v1/incidents/{id}/evidence` | user | Evidence bundle for the whole incident |
 | GET | `/v1/control-tower` | user | §54 summary: agents, execution states, approvals, blocked/risky actions, credentials, audit health |
 
 Errors are JSON `{"error": ...}`: 400 bad input, 401 no/invalid token, 403 wrong caller or role, 404, 405, 409 approval already decided.
@@ -78,6 +89,25 @@ Safety rules:
 ```bash
 PYTHONPATH=. python3 examples/serve_demo.py --db aegis.db
 ```
+
+### Incidents (§23, §24)
+
+An incident (`INC-0001`, …) groups the alerts and governed executions for one problem. Agents add
+`"incident_id"` to `POST /v1/agent/actions` to link an action as they take it; the incident is checked before the
+action runs, so an action is never taken against an unknown or closed incident.
+
+```
+open → investigating ⇄ mitigating → resolved → closed
+                 ↑__________________________|  (reopen)
+```
+
+- Agents may open incidents, attach alerts, link their own actions and set `investigating` / `mitigating`.
+  Resolving and closing are left to people, and resolving requires a written resolution.
+- Repeated alerts with the same fingerprint (default `source:name`) increase a count instead of adding rows.
+- The timeline isn't stored separately: it's every audit event about the incident or its linked executions, so it
+  has the same tamper evidence as the rest of the audit trail.
+- `GET /v1/incidents/{id}/evidence` exports the whole incident, adding `incident.json` and the root cause, impact
+  and resolution to `RCA.md`.
 
 ### Evidence bundles (§27)
 
@@ -161,6 +191,6 @@ This is the in-process core. Next steps toward the spec:
   access to the database could rebuild the whole chain
 - Vault dynamic secrets behind `CredentialBroker` (§51)
 - Metrics, logs, traces and topology in evidence bundles, once telemetry sources exist (§27, §42)
-- Incident objects that group executions and alerts (§23); bundles currently group executions by ID
+- Alert ingestion from Alertmanager, Grafana and others, with automatic correlation into incidents (§21, §22)
 - MCP server adapters that register into the Tool Registry (§17)
 - Control Tower web UI (§54; the API summary exists)

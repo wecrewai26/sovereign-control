@@ -4,6 +4,7 @@ from .approval import ApprovalEngine, ApprovalError, ApprovalState
 from .audit import AuditIntegrityError, AuditLog
 from .credentials import CredentialBroker
 from .gateway import Execution, ExecutionStatus, SovereignGateway
+from .incidents import Incident, IncidentError, IncidentManager, IncidentStatus
 from .models import (
     ActionContext,
     AgentIdentity,
@@ -35,6 +36,10 @@ __all__ = [
     "Decision",
     "Execution",
     "ExecutionStatus",
+    "Incident",
+    "IncidentError",
+    "IncidentManager",
+    "IncidentStatus",
     "PolicyEngine",
     "PolicyResult",
     "PolicyRule",

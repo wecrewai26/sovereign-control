@@ -21,6 +21,14 @@ from urllib.parse import parse_qs, urlsplit
 from . import serialize
 from .approval import ApprovalError
 from .evidence import EvidenceError, build_bundle
+from .incidents import (
+    AGENT_SETTABLE,
+    IncidentConflict,
+    IncidentError,
+    IncidentManager,
+    IncidentNotFound,
+    IncidentStatus,
+)
 from .auth import Authenticator, Principal, PrincipalKind
 from .gateway import ExecutionStatus, SovereignGateway
 from .models import RiskLevel
@@ -76,9 +84,14 @@ class Request:
 
 class ControlAPI:
     def __init__(
-        self, gateway: SovereignGateway, authenticator: Authenticator, evidence_signing_key: bytes | None = None
+        self,
+        gateway: SovereignGateway,
+        authenticator: Authenticator,
+        evidence_signing_key: bytes | None = None,
+        incidents: IncidentManager | None = None,
     ) -> None:
         self.gateway = gateway
+        self.incidents = incidents or IncidentManager(gateway)
         self.auth = authenticator
         self.evidence_signing_key = evidence_signing_key
         # The governance core is not thread-safe; serialize access to it.
@@ -89,6 +102,10 @@ class ControlAPI:
         self._route("POST", "/v1/agent/actions", agent, self.agent_submit)
         self._route("GET", "/v1/agent/actions/{id}", agent, self.agent_get)
         self._route("GET", "/v1/agent/me", agent, self.agent_me)
+        self._route("POST", "/v1/agent/incidents", agent, self.open_incident)
+        self._route("GET", "/v1/agent/incidents/{id}", agent, self.get_incident)
+        self._route("POST", "/v1/agent/incidents/{id}/alerts", agent, self.attach_alert)
+        self._route("POST", "/v1/agent/incidents/{id}/status", agent, self.agent_incident_status)
 
         self._route("GET", "/v1/tools", user, self.list_tools)
         self._route("GET", "/v1/agents", user, self.list_agents)
@@ -102,6 +119,14 @@ class ControlAPI:
         self._route("GET", "/v1/audit/verify", user, self.verify_audit)
         self._route("GET", "/v1/control-tower", user, self.control_tower)
         self._route("GET", "/v1/evidence", user, self.export_evidence)
+        self._route("GET", "/v1/incidents", user, self.list_incidents)
+        self._route("POST", "/v1/incidents", user, self.open_incident)
+        self._route("GET", "/v1/incidents/{id}", user, self.get_incident)
+        self._route("POST", "/v1/incidents/{id}/alerts", user, self.attach_alert)
+        self._route("POST", "/v1/incidents/{id}/links", user, self.link_execution)
+        self._route("POST", "/v1/incidents/{id}/status", user, self.incident_status)
+        self._route("POST", "/v1/incidents/{id}/update", user, self.update_incident)
+        self._route("GET", "/v1/incidents/{id}/evidence", user, self.incident_evidence)
 
     def _route(self, method: str, template: str, kind: PrincipalKind, handler: Handler) -> None:
         pattern = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[A-Za-z0-9_.:-]+)", template) + "$")
@@ -139,6 +164,12 @@ class ControlAPI:
                     raise HTTPError(404, str(exc.args[0])) from None
                 except ApprovalError as exc:
                     raise HTTPError(409, str(exc)) from None
+                except IncidentNotFound as exc:
+                    raise HTTPError(404, str(exc)) from None
+                except IncidentConflict as exc:
+                    raise HTTPError(409, str(exc)) from None
+                except IncidentError as exc:
+                    raise HTTPError(400, str(exc)) from None
         raise HTTPError(405 if matched_path else 404, "method not allowed" if matched_path else "not found")
 
     def _authenticate(self, headers: dict[str, str]) -> Principal:
@@ -165,8 +196,15 @@ class ControlAPI:
             ctx = serialize.parse_context(data.get("context"))
         except ValueError as exc:
             raise HTTPError(400, str(exc)) from None
+        incident_id = data.get("incident_id")
+        if incident_id is not None:
+            if not isinstance(incident_id, str):
+                raise HTTPError(400, "incident_id must be a string")
+            self.incidents.require_open(incident_id)  # check before acting, not after
         # The agent identity comes from the credential, never from the request body.
         execution = self.gateway.request(req.principal.id, tool_id, environment, params, ctx)
+        if incident_id is not None:
+            self.incidents.link_execution(incident_id, execution.execution_id, actor=req.principal.id)
         return serialize.execution(execution)
 
     def agent_get(self, req: Request) -> Any:
@@ -252,6 +290,10 @@ class ControlAPI:
                  "risk": e.risk.level.name, "status": e.status.value}
                 for e in risky[-20:]
             ],
+            "open_incidents": dict(Counter(
+                i.severity for i in self.incidents.all()
+                if i.status not in (IncidentStatus.RESOLVED, IncidentStatus.CLOSED)
+            )),
             "policies": len(self.gateway.policy.rules),
             "active_credentials": len(self.gateway.credentials.active()),
             "audit": {"events": len(self.gateway.audit.events()), "chain_valid": self.gateway.audit.verify()},
@@ -267,6 +309,88 @@ class ControlAPI:
             )
         except EvidenceError as exc:
             raise HTTPError(404 if str(exc).startswith("unknown") else 400, str(exc)) from None
+        return FileResponse(bundle.content, "application/zip", bundle.filename,
+                            {"X-Evidence-SHA256": bundle.sha256, "X-Evidence-Bundle-Id": bundle.bundle_id})
+
+    # ---- Incidents (§23, §24) -------------------------------------------------
+
+    def open_incident(self, req: Request) -> Any:
+        data = req.json()
+        allowed = {"title", "severity", "service", "environment", "impact", "affected_services", "first_observed"}
+        unknown = set(data) - allowed
+        if unknown:
+            raise HTTPError(400, f"unknown fields: {', '.join(sorted(unknown))}")
+        for key in ("title", "service", "environment", "impact", "first_observed", "severity"):
+            if key in data and not isinstance(data[key], str):
+                raise HTTPError(400, f"{key} must be a string")
+        services = data.get("affected_services", [])
+        if not isinstance(services, list) or not all(isinstance(s, str) for s in services):
+            raise HTTPError(400, "affected_services must be a list of strings")
+        source = f"agent:{req.principal.id}" if req.principal.kind is PrincipalKind.AGENT else "manual"
+        incident = self.incidents.open(
+            data.get("title", ""), actor=req.principal.id, severity=data.get("severity", "medium"),
+            service=data.get("service", ""), environment=data.get("environment", ""), detection_source=source,
+            first_observed=data.get("first_observed"), impact=data.get("impact", ""), affected_services=services,
+        )
+        return serialize.incident(incident, self.incidents.timeline(incident.incident_id))
+
+    def get_incident(self, req: Request) -> Any:
+        incident = self.incidents.get(req.params["id"])
+        return serialize.incident(incident, self.incidents.timeline(incident.incident_id))
+
+    def list_incidents(self, req: Request) -> Any:
+        incidents = self.incidents.all()
+        status, severity = req.q("status"), req.q("severity")
+        if status:
+            incidents = [i for i in incidents if i.status.value == status]
+        if severity:
+            incidents = [i for i in incidents if i.severity == severity]
+        return {"incidents": [serialize.incident(i) for i in incidents]}
+
+    def attach_alert(self, req: Request) -> Any:
+        incident = self.incidents.attach_alert(req.params["id"], req.json(), actor=req.principal.id)
+        return serialize.incident(incident)
+
+    def link_execution(self, req: Request) -> Any:
+        execution_id = req.json().get("execution_id")
+        if not isinstance(execution_id, str):
+            raise HTTPError(400, "execution_id is required")
+        return serialize.incident(self.incidents.link_execution(req.params["id"], execution_id,
+                                                                actor=req.principal.id))
+
+    def _status_args(self, req: Request) -> tuple[IncidentStatus, str, str]:
+        data = req.json()
+        try:
+            status = IncidentStatus(data.get("status"))
+        except ValueError:
+            raise HTTPError(400, f"unknown status: {data.get('status')}") from None
+        note, resolution = data.get("note", ""), data.get("resolution", "")
+        if not isinstance(note, str) or not isinstance(resolution, str):
+            raise HTTPError(400, "note and resolution must be strings")
+        return status, note, resolution
+
+    def incident_status(self, req: Request) -> Any:
+        status, note, resolution = self._status_args(req)
+        incident = self.incidents.set_status(req.params["id"], status, actor=req.principal.id, note=note,
+                                             resolution=resolution)
+        return serialize.incident(incident)
+
+    def agent_incident_status(self, req: Request) -> Any:
+        status, note, _ = self._status_args(req)
+        if status not in AGENT_SETTABLE:
+            raise HTTPError(403, "agents may only set investigating or mitigating; resolving needs a human")
+        return serialize.incident(self.incidents.set_status(req.params["id"], status, actor=req.principal.id,
+                                                            note=note))
+
+    def update_incident(self, req: Request) -> Any:
+        return serialize.incident(self.incidents.update(req.params["id"], actor=req.principal.id, **req.json()))
+
+    def incident_evidence(self, req: Request) -> Any:
+        self.incidents.get(req.params["id"])
+        bundle = build_bundle(
+            self.gateway, [], exported_by=req.principal.id, signing_key=self.evidence_signing_key,
+            incidents=self.incidents, incident_id=req.params["id"],
+        )
         return FileResponse(bundle.content, "application/zip", bundle.filename,
                             {"X-Evidence-SHA256": bundle.sha256, "X-Evidence-Bundle-Id": bundle.bundle_id})
 

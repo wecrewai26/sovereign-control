@@ -76,6 +76,14 @@ print(f"""Sovereign Control API on {base}
   curl -s -X POST {base}/v1/executions/<execution_id>/approve -H "Authorization: Bearer $SRE" -d '{{"role":"sre"}}'
   curl -s {base}/v1/control-tower -H "Authorization: Bearer $SRE"
 
+  # open an incident, then link actions to it by adding "incident_id":"INC-0001" to the request above
+  curl -s -X POST {base}/v1/agent/incidents -H "Authorization: Bearer $AGENT" \
+    -d '{{"title":"api pods crash-looping","severity":"critical","service":"api","environment":"production"}}'
+  curl -s {base}/v1/incidents/INC-0001 -H "Authorization: Bearer $SRE"
+  curl -s -X POST {base}/v1/incidents/INC-0001/status -H "Authorization: Bearer $SRE" \
+    -d '{{"status":"resolved","resolution":"Restarted crash-looping pod"}}'
+  curl -s -o incident.zip {base}/v1/incidents/INC-0001/evidence -H "Authorization: Bearer $SRE"
+
   # download an evidence bundle and verify it offline
   curl -s -o bundle.zip "{base}/v1/evidence?execution_id=<execution_id>&title=INC-1" -H "Authorization: Bearer $SRE"
   python3 -m sovereign_control.evidence verify bundle.zip

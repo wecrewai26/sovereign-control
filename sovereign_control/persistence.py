@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from .approval import ApprovalRequest
     from .audit import AuditEvent
     from .gateway import Execution
+    from .incidents import Incident
 
 
 class Store(Protocol):
@@ -39,12 +40,15 @@ class Store(Protocol):
     def save_token(self, token_hash: str, kind: str, principal_id: str, roles: list[str]) -> None: ...
     def delete_token(self, token_hash: str) -> None: ...
     def load_tokens(self) -> list[tuple[str, str, str, list[str]]]: ...
+    def save_incident(self, incident: "Incident") -> None: ...
+    def load_incidents(self) -> list["Incident"]: ...
 
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS executions (execution_id TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS incidents (incident_id TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tokens (
     token_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, principal_id TEXT NOT NULL, roles TEXT NOT NULL
 );
@@ -118,6 +122,26 @@ class SQLiteStore:
     def load_tokens(self) -> list[tuple[str, str, str, list[str]]]:
         rows = self._rows("SELECT token_hash, kind, principal_id, roles FROM tokens")
         return [(h, k, p, json.loads(r)) for h, k, p, r in rows]
+
+    # incidents
+    def save_incident(self, incident: "Incident") -> None:
+        data = asdict(incident)
+        data["status"] = incident.status.value
+        self._write(
+            "INSERT INTO incidents (incident_id, data) VALUES (?, ?) "
+            "ON CONFLICT(incident_id) DO UPDATE SET data = excluded.data",
+            (incident.incident_id, _dumps(data)),
+        )
+
+    def load_incidents(self) -> list["Incident"]:
+        from .incidents import Incident, IncidentStatus
+
+        incidents = []
+        for (raw,) in self._rows("SELECT data FROM incidents ORDER BY rowid"):
+            data = json.loads(raw)
+            data["status"] = IncidentStatus(data["status"])
+            incidents.append(Incident(**data))
+        return incidents
 
 
 def _dumps(value: Any) -> str:

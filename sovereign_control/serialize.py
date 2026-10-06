@@ -8,6 +8,7 @@ from typing import Any
 from .approval import ApprovalRequest
 from .audit import AuditEvent
 from .gateway import Execution
+from .incidents import Incident
 from .models import ActionContext, AgentIdentity, ToolDefinition
 
 
@@ -94,6 +95,19 @@ def execution(e: Execution) -> dict[str, Any]:
 
 def audit_event(ev: AuditEvent) -> dict[str, Any]:
     return asdict(ev)
+
+
+def incident(i: Incident, timeline: list[AuditEvent] | None = None) -> dict[str, Any]:
+    data = asdict(i)
+    data["status"] = i.status.value
+    data["alert_count"] = sum(a["count"] for a in i.alerts)
+    if timeline is not None:
+        data["timeline"] = [
+            {"time": e.timestamp, "event": e.event_type, "actor": e.actor, "execution_id": e.execution_id,
+             "details": e.data}
+            for e in timeline
+        ]
+    return data
 
 
 _CONTEXT_FIELDS = {f.name: f for f in fields(ActionContext)}

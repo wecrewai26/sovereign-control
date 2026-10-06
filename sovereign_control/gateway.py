@@ -11,7 +11,7 @@ from __future__ import annotations
 import enum
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .approval import ApprovalEngine, ApprovalError, ApprovalRequest, ApprovalState
 from .audit import AuditLog
@@ -21,12 +21,18 @@ from .policy import PolicyEngine, PolicyResult
 from .registry import AgentRegistry, ToolRegistry
 from .risk import RiskAssessment, RiskEngine
 
+if TYPE_CHECKING:
+    from .persistence import Store
+
 
 class ExecutionStatus(str, enum.Enum):
     DENIED = "denied"
     RECOMMENDED = "recommended"
     PENDING_APPROVAL = "pending_approval"
     REJECTED = "rejected"
+    EXECUTING = "executing"
+    # The process stopped while the tool was running; the outcome is unknown and needs a human.
+    INTERRUPTED = "interrupted"
     SUCCEEDED = "succeeded"
     EXECUTION_FAILED = "execution_failed"
     ROLLED_BACK = "rolled_back"
@@ -62,15 +68,36 @@ class SovereignGateway:
         approvals: ApprovalEngine | None = None,
         credentials: CredentialBroker | None = None,
         audit: AuditLog | None = None,
+        store: "Store | None" = None,
     ) -> None:
+        self.store = store
         self.tools = tools or ToolRegistry()
-        self.agents = agents or AgentRegistry()
+        self.agents = agents or AgentRegistry(store)
         self.policy = policy or PolicyEngine()
         self.risk = risk or RiskEngine()
         self.approvals = approvals or ApprovalEngine()
         self.credentials = credentials or CredentialBroker()
-        self.audit = audit or AuditLog()
+        self.audit = audit or AuditLog(store)
         self._executions: dict[str, Execution] = {}
+        if store:
+            self._recover(store)
+
+    def _recover(self, store: "Store") -> None:
+        """Reload executions after a restart, reopening pending approvals.
+
+        Anything that was mid-execution is never re-run automatically: its outcome
+        is unknown, so it is marked interrupted and escalated to a human.
+        """
+        for execution in store.load_executions():
+            self._executions[execution.execution_id] = execution
+            if execution.status is ExecutionStatus.PENDING_APPROVAL and execution.approval:
+                self.approvals.restore(execution.approval)
+            elif execution.status is ExecutionStatus.EXECUTING:
+                execution.status = ExecutionStatus.INTERRUPTED
+                execution.error = "process stopped during execution; outcome unknown"
+                self.audit.record("execution.interrupted", "gateway", execution.execution_id)
+                self._escalate(execution, execution.error)
+                self._save(execution)
 
     def request(
         self,
@@ -81,8 +108,13 @@ class SovereignGateway:
         context: ActionContext | None = None,
     ) -> Execution:
         """Submit a tool call. Returns the execution in its resulting state."""
-        params = params or {}
-        ctx = context or ActionContext()
+        execution = self._submit(agent_id, tool_id, environment, params or {}, context or ActionContext())
+        self._save(execution)
+        return execution
+
+    def _submit(
+        self, agent_id: str, tool_id: str, environment: str, params: dict[str, Any], ctx: ActionContext
+    ) -> Execution:
         agent = self.agents.get(agent_id)
         tool = self.tools.get(tool_id)
         execution_id = f"exe-{uuid.uuid4().hex[:12]}"
@@ -151,6 +183,7 @@ class SovereignGateway:
         self.audit.record("approval.granted", user, execution_id, role=role, state=approval.state.value)
         if approval.state is ApprovalState.APPROVED:
             self._execute(execution)
+        self._save(execution)
         return execution
 
     def reject(self, execution_id: str, user: str, reason: str = "") -> Execution:
@@ -159,6 +192,7 @@ class SovereignGateway:
         self.approvals.reject(execution.approval.approval_id, user, reason)
         execution.status = ExecutionStatus.REJECTED
         self.audit.record("approval.rejected", user, execution_id, reason=reason)
+        self._save(execution)
         return execution
 
     def get(self, execution_id: str) -> Execution:
@@ -183,6 +217,9 @@ class SovereignGateway:
             self.audit.record("tool.blocked", "gateway", eid, reason=execution.error)
             return
 
+        # Persist before touching infrastructure so a crash mid-action is visible on restart.
+        execution.status = ExecutionStatus.EXECUTING
+        self._save(execution)
         cred = self.credentials.issue(execution.agent_id, tool.tool_id, execution.environment)
         self.audit.record("credential.issued", "credential-broker", eid, expires_at=cred.expires_at.isoformat())
         try:
@@ -239,6 +276,10 @@ class SovereignGateway:
             execution.status = ExecutionStatus.ROLLED_BACK
             self.audit.record("rollback.completed", "rollback-engine", eid)
         self._escalate(execution, "verification failed")
+
+    def _save(self, execution: Execution) -> None:
+        if self.store:
+            self.store.save_execution(execution)
 
     def _escalate(self, execution: Execution, reason: str) -> None:
         execution.escalated = True

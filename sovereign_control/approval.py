@@ -52,6 +52,10 @@ class ApprovalEngine:
         self._requests[req.approval_id] = req
         return req
 
+    def restore(self, req: ApprovalRequest) -> None:
+        """Re-attach a persisted request after a restart."""
+        self._requests[req.approval_id] = req
+
     def get(self, approval_id: str) -> ApprovalRequest:
         try:
             req = self._requests[approval_id]

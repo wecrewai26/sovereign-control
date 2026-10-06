@@ -1,7 +1,7 @@
 """WeCrew AEGIS — Sovereign Control: the governance plane for autonomous operations agents."""
 
 from .approval import ApprovalEngine, ApprovalError, ApprovalState
-from .audit import AuditLog
+from .audit import AuditIntegrityError, AuditLog
 from .credentials import CredentialBroker
 from .gateway import Execution, ExecutionStatus, SovereignGateway
 from .models import (
@@ -14,6 +14,7 @@ from .models import (
     RiskLevel,
     ToolDefinition,
 )
+from .persistence import SQLiteStore, Store
 from .policy import PolicyEngine, PolicyResult, PolicyRule
 from .registry import AgentRegistry, RegistryError, ToolRegistry
 from .risk import RiskAssessment, RiskEngine
@@ -26,6 +27,7 @@ __all__ = [
     "ApprovalError",
     "ApprovalMode",
     "ApprovalState",
+    "AuditIntegrityError",
     "AuditLog",
     "AutonomyLevel",
     "Credential",
@@ -40,7 +42,9 @@ __all__ = [
     "RiskAssessment",
     "RiskEngine",
     "RiskLevel",
+    "SQLiteStore",
     "SovereignGateway",
+    "Store",
     "ToolDefinition",
     "ToolRegistry",
 ]

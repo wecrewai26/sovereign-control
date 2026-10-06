@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from .models import AgentIdentity, AutonomyLevel, RiskLevel, ToolDefinition, utcnow
+
+if TYPE_CHECKING:
+    from .persistence import Store
 
 
 class RegistryError(KeyError):
@@ -32,8 +36,9 @@ class ToolRegistry:
 
 
 class AgentRegistry:
-    def __init__(self) -> None:
-        self._agents: dict[str, AgentIdentity] = {}
+    def __init__(self, store: "Store | None" = None) -> None:
+        self._store = store
+        self._agents: dict[str, AgentIdentity] = {a.agent_id: a for a in (store.load_agents() if store else [])}
 
     def issue(
         self,
@@ -63,6 +68,7 @@ class AgentRegistry:
             expires_at=utcnow() + ttl,
         )
         self._agents[agent_id] = identity
+        self._save(identity)
         return identity
 
     def get(self, agent_id: str) -> AgentIdentity:
@@ -72,7 +78,13 @@ class AgentRegistry:
             raise RegistryError(f"unknown agent: {agent_id}") from None
 
     def disable(self, agent_id: str) -> None:
-        self.get(agent_id).enabled = False
+        identity = self.get(agent_id)
+        identity.enabled = False
+        self._save(identity)
+
+    def _save(self, identity: AgentIdentity) -> None:
+        if self._store:
+            self._store.save_agent(identity)
 
     def all(self) -> list[AgentIdentity]:
         return list(self._agents.values())

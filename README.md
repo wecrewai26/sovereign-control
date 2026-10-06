@@ -25,6 +25,7 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `audit.AuditLog` | §26, §27 | Append-only SHA-256 hash chain; `verify()` detects edits, insertions and deletions |
 
 | `api.ControlAPI` | §10, §54 | HTTP API Gateway (humans) and Agent Gateway (agents), plus the Control Tower summary |
+| `persistence.SQLiteStore` | §26, §27 | Durable audit trail, agent identities, executions, approvals and token hashes (standard-library SQLite) |
 | `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
 
 ### HTTP API
@@ -51,6 +52,29 @@ Errors are JSON `{"error": ...}`: 400 bad input, 401 no/invalid token, 403 wrong
 
 ```bash
 PYTHONPATH=. python3 examples/serve_demo.py   # prints tokens and curl examples
+```
+
+### Persistence
+
+```python
+gw = SovereignGateway(store=SQLiteStore("aegis.db"))
+auth = TokenAuthenticator(store=gw.store)
+```
+
+What a restart keeps: agent identities (including disabled ones), every execution with its risk, policy decision and
+approval state, pending approvals (still approvable), token hashes, and the audit trail. Tools and policy rules are
+code, so they are registered again at startup.
+
+Safety rules:
+- **Audit first.** Each audit event is written to disk before it counts, and the audit table is insert-only.
+- **Tamper check on startup.** If the stored hash chain doesn't verify (an edited, inserted or deleted row), startup
+  fails with `AuditIntegrityError` rather than appending to a broken record.
+- **No silent re-runs.** An execution is saved as `executing` before the tool runs. If the process dies mid-action,
+  the next start marks it `interrupted` and escalates it to a human; it is never re-run automatically, because the
+  outcome is unknown.
+
+```bash
+PYTHONPATH=. python3 examples/serve_demo.py --db aegis.db
 ```
 
 ### Autonomy levels (§4.5)
@@ -103,8 +127,10 @@ gw.audit.verify()  # True
 
 This is the in-process core. Next steps toward the spec:
 - Keycloak/OIDC authenticator for human identity (§48) and OPA/Rego as a policy backend (§49)
-- TLS termination (put the API behind a reverse proxy until then) and persistent state across restarts
+- TLS termination (put the API behind a reverse proxy until then)
+- Signing or external anchoring of the audit chain: the hash chain catches partial edits, but someone with write
+  access to the database could rebuild the whole chain
 - Vault dynamic secrets behind `CredentialBroker` (§51)
-- Persistent evidence store and incident evidence bundle export (§27)
+- Incident evidence bundle export (§27)
 - MCP server adapters that register into the Tool Registry (§17)
 - Control Tower web UI (§54; the API summary exists)

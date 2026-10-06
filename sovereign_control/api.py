@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import serialize
 from .approval import ApprovalError
+from .evidence import EvidenceError, build_bundle
 from .auth import Authenticator, Principal, PrincipalKind
 from .gateway import ExecutionStatus, SovereignGateway
 from .models import RiskLevel
@@ -34,6 +35,16 @@ class HTTPError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class FileResponse:
+    """A non-JSON response body, sent as a download."""
+
+    def __init__(self, content: bytes, content_type: str, filename: str, headers: dict[str, str] | None = None):
+        self.content = content
+        self.content_type = content_type
+        self.filename = filename
+        self.headers = headers or {}
 
 
 Response = tuple[int, Any]
@@ -64,9 +75,12 @@ class Request:
 
 
 class ControlAPI:
-    def __init__(self, gateway: SovereignGateway, authenticator: Authenticator) -> None:
+    def __init__(
+        self, gateway: SovereignGateway, authenticator: Authenticator, evidence_signing_key: bytes | None = None
+    ) -> None:
         self.gateway = gateway
         self.auth = authenticator
+        self.evidence_signing_key = evidence_signing_key
         # The governance core is not thread-safe; serialize access to it.
         self._lock = threading.Lock()
         self._routes: list[tuple[str, re.Pattern[str], PrincipalKind, Handler]] = []
@@ -87,6 +101,7 @@ class ControlAPI:
         self._route("GET", "/v1/audit", user, self.list_audit)
         self._route("GET", "/v1/audit/verify", user, self.verify_audit)
         self._route("GET", "/v1/control-tower", user, self.control_tower)
+        self._route("GET", "/v1/evidence", user, self.export_evidence)
 
     def _route(self, method: str, template: str, kind: PrincipalKind, handler: Handler) -> None:
         pattern = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[A-Za-z0-9_.:-]+)", template) + "$")
@@ -242,6 +257,19 @@ class ControlAPI:
             "audit": {"events": len(self.gateway.audit.events()), "chain_valid": self.gateway.audit.verify()},
         }
 
+    def export_evidence(self, req: Request) -> Any:
+        """Spec §27: download an evidence bundle for one or more executions (?execution_id=… repeatable)."""
+        title = req.q("title") or ""
+        try:
+            bundle = build_bundle(
+                self.gateway, req.query.get("execution_id", []), exported_by=req.principal.id,
+                title=title, signing_key=self.evidence_signing_key,
+            )
+        except EvidenceError as exc:
+            raise HTTPError(404 if str(exc).startswith("unknown") else 400, str(exc)) from None
+        return FileResponse(bundle.content, "application/zip", bundle.filename,
+                            {"X-Evidence-SHA256": bundle.sha256, "X-Evidence-Bundle-Id": bundle.bundle_id})
+
     def _execution(self, execution_id: str):
         try:
             return self.gateway.get(execution_id)
@@ -260,10 +288,17 @@ def _make_handler(api: ControlAPI) -> type[BaseHTTPRequestHandler]:
             else:
                 body = self.rfile.read(length) if length else b""
                 status, payload = api.handle(self.command, self.path, dict(self.headers), body)
-            data = json.dumps(payload, default=str).encode()
+            extra: dict[str, str] = {}
+            if isinstance(payload, FileResponse):
+                data, content_type = payload.content, payload.content_type
+                extra = {"Content-Disposition": f'attachment; filename="{payload.filename}"', **payload.headers}
+            else:
+                data, content_type = json.dumps(payload, default=str).encode(), "application/json"
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            for name, value in extra.items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
 

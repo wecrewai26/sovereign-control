@@ -1,6 +1,6 @@
 """Run the Sovereign Control API locally with demo tools, agents and users.
 
-    PYTHONPATH=. python3 examples/serve_demo.py [--port 8080] [--db aegis.db]
+    PYTHONPATH=. python3 examples/serve_demo.py [--port 8080] [--db aegis.db] [--evidence-key-file KEY]
 
 Prints bearer tokens and example curl commands. Binds to 127.0.0.1 only.
 With --db, agents, executions, approvals, tokens and the audit trail survive restarts.
@@ -23,7 +23,9 @@ from sovereign_control.auth import TokenAuthenticator
 parser = argparse.ArgumentParser()
 parser.add_argument("--port", type=int, default=8080)
 parser.add_argument("--db", help="SQLite file for durable state (default: in memory)")
+parser.add_argument("--evidence-key-file", help="file holding the key used to sign evidence bundles")
 args = parser.parse_args()
+evidence_key = open(args.evidence_key_file, "rb").read().strip() if args.evidence_key_file else None
 store = SQLiteStore(args.db) if args.db else None
 
 pods = {"api-7f9": "CrashLoopBackOff", "api-2c1": "Running"}
@@ -57,7 +59,7 @@ sre_token = auth.add_user("alice", {"sre"})
 admin_token = auth.add_user("root", {"admin"})
 
 port = args.port
-server = make_server(ControlAPI(gw, auth), "127.0.0.1", port)
+server = make_server(ControlAPI(gw, auth, evidence_signing_key=evidence_key), "127.0.0.1", port)
 base = f"http://127.0.0.1:{port}"
 print(f"""Sovereign Control API on {base}
 
@@ -73,6 +75,10 @@ print(f"""Sovereign Control API on {base}
   curl -s {base}/v1/approvals -H "Authorization: Bearer $SRE"
   curl -s -X POST {base}/v1/executions/<execution_id>/approve -H "Authorization: Bearer $SRE" -d '{{"role":"sre"}}'
   curl -s {base}/v1/control-tower -H "Authorization: Bearer $SRE"
+
+  # download an evidence bundle and verify it offline
+  curl -s -o bundle.zip "{base}/v1/evidence?execution_id=<execution_id>&title=INC-1" -H "Authorization: Bearer $SRE"
+  python3 -m sovereign_control.evidence verify bundle.zip
 """)
 try:
     server.serve_forever()

@@ -26,6 +26,7 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 
 | `api.ControlAPI` | §10, §54 | HTTP API Gateway (humans) and Agent Gateway (agents), plus the Control Tower summary |
 | `persistence.SQLiteStore` | §26, §27 | Durable audit trail, agent identities, executions, approvals and token hashes (standard-library SQLite) |
+| `evidence` | §26, §27 | Evidence bundle export (zip with manifest of SHA-256 hashes, optional HMAC signature) and an offline verifier |
 | `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
 
 ### HTTP API
@@ -46,6 +47,7 @@ User tokens and agent tokens are kept apart: an agent can't call human endpoints
 | POST | `/v1/executions/{id}/reject` | user | `{reason}` |
 | GET | `/v1/approvals` | user | Pending approvals |
 | GET | `/v1/audit[?execution_id=]`, `/v1/audit/verify` | user | Audit trail and hash-chain check |
+| GET | `/v1/evidence?execution_id=…[&execution_id=…][&title=…]` | user | Download an evidence bundle (zip). The export is itself written to the audit trail with the file's SHA-256 |
 | GET | `/v1/control-tower` | user | §54 summary: agents, execution states, approvals, blocked/risky actions, credentials, audit health |
 
 Errors are JSON `{"error": ...}`: 400 bad input, 401 no/invalid token, 403 wrong caller or role, 404, 405, 409 approval already decided.
@@ -76,6 +78,33 @@ Safety rules:
 ```bash
 PYTHONPATH=. python3 examples/serve_demo.py --db aegis.db
 ```
+
+### Evidence bundles (§27)
+
+One zip per incident, covering one or more executions:
+
+```
+evb-<id>.zip
+├── manifest.json       contents, SHA-256 of every file, audit chain state at export
+├── manifest.sig        HMAC-SHA256 of the manifest (when a signing key is configured)
+├── timeline.json       every audit event for these executions, in order
+├── RCA.md              agent hypothesis, evidence, confidence, risk, policy decision, outcome
+├── remediation.json    tool, parameters, risk factors, policy reasons, result
+├── approvals.json      approvers and roles, rejections, expiry
+├── verification.json   verified?, rolled back?, escalated to a human?
+└── audit.json          the raw hash-chained audit events
+```
+
+An auditor can check a bundle without access to the system:
+
+```bash
+python3 -m sovereign_control.evidence verify evb-1234.zip --key-file evidence.key
+```
+
+This confirms no file was changed, added or removed since export, every audit event still matches its own hash, and,
+when signed, that the manifest came from a holder of the key. Each export is recorded in the audit trail with the
+bundle's SHA-256, so a bundle can be matched to the system's own record of producing it. Metrics, logs and traces
+will be added to bundles once telemetry sources are connected.
 
 ### Autonomy levels (§4.5)
 
@@ -131,6 +160,7 @@ This is the in-process core. Next steps toward the spec:
 - Signing or external anchoring of the audit chain: the hash chain catches partial edits, but someone with write
   access to the database could rebuild the whole chain
 - Vault dynamic secrets behind `CredentialBroker` (§51)
-- Incident evidence bundle export (§27)
+- Metrics, logs, traces and topology in evidence bundles, once telemetry sources exist (§27, §42)
+- Incident objects that group executions and alerts (§23); bundles currently group executions by ID
 - MCP server adapters that register into the Tool Registry (§17)
 - Control Tower web UI (§54; the API summary exists)

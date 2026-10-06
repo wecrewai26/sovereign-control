@@ -24,6 +24,35 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `gateway.SovereignGateway` | §19, §28, §29 | Orchestrates the flow; verifies after action, rolls back on failure, escalates to a human |
 | `audit.AuditLog` | §26, §27 | Append-only SHA-256 hash chain; `verify()` detects edits, insertions and deletions |
 
+| `api.ControlAPI` | §10, §54 | HTTP API Gateway (humans) and Agent Gateway (agents), plus the Control Tower summary |
+| `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
+
+### HTTP API
+
+Standard library only, so it runs air-gapped. Every endpoint except `/healthz` needs `Authorization: Bearer <token>`.
+User tokens and agent tokens are kept apart: an agent can't call human endpoints, and a human can't submit as an agent.
+
+| Method | Path | Caller | Purpose |
+|---|---|---|---|
+| POST | `/v1/agent/actions` | agent | Submit a tool call `{tool_id, environment, params, context}`. The agent's identity comes from its token, never the body |
+| GET | `/v1/agent/actions/{id}` | agent | Track one of its own executions (other agents' are not visible) |
+| GET | `/v1/agent/me` | agent | Its own identity and scopes |
+| GET | `/v1/tools`, `/v1/agents` | user | Registry contents |
+| POST | `/v1/agents/{id}/disable` | user with `admin` | Kill switch for an agent |
+| GET | `/v1/executions[?status=&agent_id=&environment=&tool_id=]` | user | List and filter executions |
+| GET | `/v1/executions/{id}` | user | Full execution: risk factors, policy reasons, approval, result |
+| POST | `/v1/executions/{id}/approve` | user | `{role}`. The role must be one the caller holds |
+| POST | `/v1/executions/{id}/reject` | user | `{reason}` |
+| GET | `/v1/approvals` | user | Pending approvals |
+| GET | `/v1/audit[?execution_id=]`, `/v1/audit/verify` | user | Audit trail and hash-chain check |
+| GET | `/v1/control-tower` | user | §54 summary: agents, execution states, approvals, blocked/risky actions, credentials, audit health |
+
+Errors are JSON `{"error": ...}`: 400 bad input, 401 no/invalid token, 403 wrong caller or role, 404, 405, 409 approval already decided.
+
+```bash
+PYTHONPATH=. python3 examples/serve_demo.py   # prints tokens and curl examples
+```
+
 ### Autonomy levels (§4.5)
 
 | Level | Mutating tools |
@@ -73,9 +102,9 @@ gw.audit.verify()  # True
 ## Not yet built
 
 This is the in-process core. Next steps toward the spec:
-- HTTP API and Agent Gateway (§10)
-- Keycloak/OIDC for human identity (§48) and OPA/Rego as a policy backend (§49)
+- Keycloak/OIDC authenticator for human identity (§48) and OPA/Rego as a policy backend (§49)
+- TLS termination (put the API behind a reverse proxy until then) and persistent state across restarts
 - Vault dynamic secrets behind `CredentialBroker` (§51)
 - Persistent evidence store and incident evidence bundle export (§27)
 - MCP server adapters that register into the Tool Registry (§17)
-- Control Tower view (§54)
+- Control Tower web UI (§54; the API summary exists)

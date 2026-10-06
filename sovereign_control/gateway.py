@@ -1,0 +1,245 @@
+"""Sovereign gateway: the governed tool-calling flow (spec §19, §28, §29).
+
+    Agent → Tool Registry → Risk → Policy → Approval → Credential broker
+          → Execution → Verification → (Rollback) → Evidence
+
+Every step is written to the audit log. An agent never calls a tool directly.
+"""
+
+from __future__ import annotations
+
+import enum
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+from .approval import ApprovalEngine, ApprovalError, ApprovalRequest, ApprovalState
+from .audit import AuditLog
+from .credentials import CredentialBroker
+from .models import ActionContext, Decision
+from .policy import PolicyEngine, PolicyResult
+from .registry import AgentRegistry, ToolRegistry
+from .risk import RiskAssessment, RiskEngine
+
+
+class ExecutionStatus(str, enum.Enum):
+    DENIED = "denied"
+    RECOMMENDED = "recommended"
+    PENDING_APPROVAL = "pending_approval"
+    REJECTED = "rejected"
+    SUCCEEDED = "succeeded"
+    EXECUTION_FAILED = "execution_failed"
+    ROLLED_BACK = "rolled_back"
+    ROLLBACK_FAILED = "rollback_failed"
+
+
+@dataclass
+class Execution:
+    execution_id: str
+    agent_id: str
+    tool_id: str
+    environment: str
+    params: dict[str, Any]
+    context: ActionContext
+    risk: RiskAssessment
+    policy: PolicyResult
+    status: ExecutionStatus
+    approval: ApprovalRequest | None = None
+    result: Any = None
+    error: str | None = None
+    verified: bool | None = None
+    escalated: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
+class SovereignGateway:
+    def __init__(
+        self,
+        tools: ToolRegistry | None = None,
+        agents: AgentRegistry | None = None,
+        policy: PolicyEngine | None = None,
+        risk: RiskEngine | None = None,
+        approvals: ApprovalEngine | None = None,
+        credentials: CredentialBroker | None = None,
+        audit: AuditLog | None = None,
+    ) -> None:
+        self.tools = tools or ToolRegistry()
+        self.agents = agents or AgentRegistry()
+        self.policy = policy or PolicyEngine()
+        self.risk = risk or RiskEngine()
+        self.approvals = approvals or ApprovalEngine()
+        self.credentials = credentials or CredentialBroker()
+        self.audit = audit or AuditLog()
+        self._executions: dict[str, Execution] = {}
+
+    def request(
+        self,
+        agent_id: str,
+        tool_id: str,
+        environment: str,
+        params: dict[str, Any] | None = None,
+        context: ActionContext | None = None,
+    ) -> Execution:
+        """Submit a tool call. Returns the execution in its resulting state."""
+        params = params or {}
+        ctx = context or ActionContext()
+        agent = self.agents.get(agent_id)
+        tool = self.tools.get(tool_id)
+        execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+
+        self.audit.record(
+            "tool.requested",
+            agent_id,
+            execution_id,
+            tool_id=tool_id,
+            environment=environment,
+            params=params,
+            hypothesis=ctx.hypothesis,
+            evidence=ctx.evidence,
+            confidence=ctx.confidence,
+        )
+        risk = self.risk.assess(tool, environment, ctx)
+        self.audit.record("risk.assessed", "risk-engine", execution_id, score=risk.score, level=risk.level.name, factors=risk.factors)
+        result = self.policy.evaluate(agent, tool, environment, ctx, risk)
+        self.audit.record(
+            "policy.evaluated",
+            "policy-engine",
+            execution_id,
+            decision=result.decision.name,
+            reasons=list(result.reasons),
+            approval_mode=result.approval_mode.value if result.approval_mode else None,
+        )
+
+        execution = Execution(
+            execution_id=execution_id,
+            agent_id=agent_id,
+            tool_id=tool_id,
+            environment=environment,
+            params=params,
+            context=ctx,
+            risk=risk,
+            policy=result,
+            status=ExecutionStatus.DENIED,
+        )
+        self._executions[execution_id] = execution
+
+        if result.decision is Decision.DENY:
+            return execution
+        if result.decision is Decision.RECOMMEND_ONLY:
+            execution.status = ExecutionStatus.RECOMMENDED
+            self.audit.record("action.recommended", agent_id, execution_id)
+            return execution
+        if result.decision is Decision.ALLOW_WITH_APPROVAL:
+            assert result.approval_mode is not None
+            execution.approval = self.approvals.open(
+                execution_id, agent_id, result.approval_mode, f"{tool_id} in {environment} ({risk.level.name} risk)"
+            )
+            execution.status = ExecutionStatus.PENDING_APPROVAL
+            self.audit.record(
+                "approval.requested", agent_id, execution_id,
+                approval_id=execution.approval.approval_id, mode=result.approval_mode.value,
+            )
+            return execution
+
+        self._execute(execution)
+        return execution
+
+    def approve(self, execution_id: str, user: str, role: str) -> Execution:
+        execution = self._pending(execution_id)
+        assert execution.approval is not None
+        approval = self.approvals.approve(execution.approval.approval_id, user, role)
+        self.audit.record("approval.granted", user, execution_id, role=role, state=approval.state.value)
+        if approval.state is ApprovalState.APPROVED:
+            self._execute(execution)
+        return execution
+
+    def reject(self, execution_id: str, user: str, reason: str = "") -> Execution:
+        execution = self._pending(execution_id)
+        assert execution.approval is not None
+        self.approvals.reject(execution.approval.approval_id, user, reason)
+        execution.status = ExecutionStatus.REJECTED
+        self.audit.record("approval.rejected", user, execution_id, reason=reason)
+        return execution
+
+    def get(self, execution_id: str) -> Execution:
+        return self._executions[execution_id]
+
+    def executions(self) -> list[Execution]:
+        return list(self._executions.values())
+
+    def _pending(self, execution_id: str) -> Execution:
+        execution = self.get(execution_id)
+        if execution.status is not ExecutionStatus.PENDING_APPROVAL or execution.approval is None:
+            raise ApprovalError(f"execution {execution_id} is not awaiting approval")
+        return execution
+
+    def _execute(self, execution: Execution) -> None:
+        tool = self.tools.get(execution.tool_id)
+        eid = execution.execution_id
+        # Re-check identity at execution time: approval may arrive after the agent was disabled.
+        if not self.agents.get(execution.agent_id).is_active():
+            execution.status = ExecutionStatus.DENIED
+            execution.error = "agent identity disabled or expired before execution"
+            self.audit.record("tool.blocked", "gateway", eid, reason=execution.error)
+            return
+
+        cred = self.credentials.issue(execution.agent_id, tool.tool_id, execution.environment)
+        self.audit.record("credential.issued", "credential-broker", eid, expires_at=cred.expires_at.isoformat())
+        try:
+            try:
+                execution.result = tool.handler(execution.params, cred)
+            except Exception as exc:  # noqa: BLE001 - tool failures are data, not crashes
+                execution.status = ExecutionStatus.EXECUTION_FAILED
+                execution.error = f"{type(exc).__name__}: {exc}"
+                self.audit.record("tool.failed", execution.agent_id, eid, error=execution.error)
+                self._escalate(execution, "execution failed")
+                return
+            self.audit.record("tool.executed", execution.agent_id, eid, result=execution.result)
+
+            if tool.verifier is None:
+                execution.status = ExecutionStatus.SUCCEEDED
+                execution.notes.append("no verifier registered; success is unverified")
+                self.audit.record("verification.skipped", "verification-engine", eid)
+                return
+
+            execution.verified = self._verify(execution, tool.verifier)
+            if execution.verified:
+                execution.status = ExecutionStatus.SUCCEEDED
+                return
+            self._rollback(execution, cred)
+        finally:
+            self.credentials.revoke(cred)
+            self.audit.record("credential.revoked", "credential-broker", eid)
+
+    def _verify(self, execution: Execution, verifier) -> bool:
+        try:
+            ok = bool(verifier(execution.params, execution.result))
+        except Exception as exc:  # noqa: BLE001
+            execution.notes.append(f"verifier raised {type(exc).__name__}: {exc}")
+            ok = False
+        self.audit.record("verification.completed", "verification-engine", execution.execution_id, passed=ok)
+        return ok
+
+    def _rollback(self, execution: Execution, cred) -> None:
+        tool = self.tools.get(execution.tool_id)
+        eid = execution.execution_id
+        if tool.rollback is None:
+            execution.status = ExecutionStatus.ROLLBACK_FAILED
+            execution.error = "verification failed and tool has no rollback"
+            self.audit.record("rollback.unavailable", "rollback-engine", eid)
+            self._escalate(execution, execution.error)
+            return
+        try:
+            tool.rollback(execution.params, execution.result, cred)
+        except Exception as exc:  # noqa: BLE001
+            execution.status = ExecutionStatus.ROLLBACK_FAILED
+            execution.error = f"rollback raised {type(exc).__name__}: {exc}"
+            self.audit.record("rollback.failed", "rollback-engine", eid, error=execution.error)
+        else:
+            execution.status = ExecutionStatus.ROLLED_BACK
+            self.audit.record("rollback.completed", "rollback-engine", eid)
+        self._escalate(execution, "verification failed")
+
+    def _escalate(self, execution: Execution, reason: str) -> None:
+        execution.escalated = True
+        self.audit.record("escalated.to_human", "gateway", execution.execution_id, reason=reason)

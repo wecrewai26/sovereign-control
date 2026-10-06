@@ -145,37 +145,59 @@ class IncidentManager:
         return incident
 
     def attach_alert(self, incident_id: str, alert: dict[str, Any], *, actor: str) -> Incident:
-        """Attach an alert. Alerts with the same fingerprint are de-duplicated into a count (spec §21)."""
+        """Attach an alert, or update one already attached (spec §21).
+
+        Alerts with the same fingerprint are de-duplicated into a count. An alert with
+        status "resolved" marks the matching attached alert as cleared.
+        """
         incident = self.require_open(incident_id)
         name = alert.get("name")
         if not isinstance(name, str) or not name:
             raise IncidentError("alert.name is required")
-        fingerprint = str(alert.get("fingerprint") or f"{alert.get('source', '')}:{name}")
-        received_at = utcnow().isoformat()
-        for existing in incident.alerts:
-            if existing["fingerprint"] == fingerprint:
-                existing["count"] += 1
-                existing["last_seen"] = received_at
-                self._record(incident, "incident.alert_repeated", actor, fingerprint=fingerprint,
-                             count=existing["count"])
-                return incident
+        status = alert.get("status", "firing")
+        if status not in ("firing", "resolved"):
+            raise IncidentError("alert.status must be firing or resolved")
         labels = alert.get("labels") or {}
         if not isinstance(labels, dict):
             raise IncidentError("alert.labels must be an object")
+        fingerprint = str(alert.get("fingerprint") or f"{alert.get('source', '')}:{name}")
+        now = utcnow().isoformat()
+
+        for existing in incident.alerts:
+            if existing["fingerprint"] != fingerprint:
+                continue
+            if status == "resolved":
+                if existing.get("status") != "resolved":
+                    existing["status"] = "resolved"
+                    existing["resolved_at"] = now
+                    self._record(incident, "incident.alert_resolved", actor, fingerprint=fingerprint)
+                return incident
+            existing["count"] += 1
+            existing["last_seen"] = now
+            existing["status"] = "firing"
+            existing["resolved_at"] = None
+            self._record(incident, "incident.alert_repeated", actor, fingerprint=fingerprint,
+                         count=existing["count"])
+            return incident
+
         record = {
             "fingerprint": fingerprint,
             "name": name,
             "source": str(alert.get("source", "")),
             "severity": str(alert.get("severity", "")),
+            "service": str(alert.get("service", "")),
+            "environment": str(alert.get("environment", "")),
             "summary": str(alert.get("summary", "")),
             "labels": {str(k): str(v) for k, v in labels.items()},
-            "first_seen": received_at,
-            "last_seen": received_at,
+            "status": status,
+            "first_seen": now,
+            "last_seen": now,
+            "resolved_at": now if status == "resolved" else None,
             "count": 1,
         }
         incident.alerts.append(record)
         self._record(incident, "incident.alert_attached", actor, fingerprint=fingerprint, name=name,
-                     source=record["source"], alert_severity=record["severity"])
+                     source=record["source"], alert_severity=record["severity"], service=record["service"])
         return incident
 
     def link_execution(self, incident_id: str, execution_id: str, *, actor: str) -> Incident:

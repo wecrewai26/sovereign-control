@@ -14,11 +14,13 @@ import json
 import re
 import threading
 from collections import Counter
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
 from . import serialize
+from .alertmind import AlertError, AlertMind, Silence, parse_alertmanager, parse_generic
 from .approval import ApprovalError
 from .evidence import EvidenceError, build_bundle
 from .incidents import (
@@ -31,7 +33,7 @@ from .incidents import (
 )
 from .auth import Authenticator, Principal, PrincipalKind
 from .gateway import ExecutionStatus, SovereignGateway
-from .models import RiskLevel
+from .models import RiskLevel, utcnow
 from .registry import RegistryError
 
 MAX_BODY_BYTES = 1_000_000
@@ -89,16 +91,20 @@ class ControlAPI:
         authenticator: Authenticator,
         evidence_signing_key: bytes | None = None,
         incidents: IncidentManager | None = None,
+        alertmind: AlertMind | None = None,
     ) -> None:
         self.gateway = gateway
         self.incidents = incidents or IncidentManager(gateway)
+        self.alertmind = alertmind or AlertMind(self.incidents)
         self.auth = authenticator
         self.evidence_signing_key = evidence_signing_key
         # The governance core is not thread-safe; serialize access to it.
         self._lock = threading.Lock()
         self._routes: list[tuple[str, re.Pattern[str], PrincipalKind, Handler]] = []
 
-        agent, user = PrincipalKind.AGENT, PrincipalKind.USER
+        agent, user, integration = PrincipalKind.AGENT, PrincipalKind.USER, PrincipalKind.INTEGRATION
+        self._route("POST", "/v1/ingest/alertmanager", integration, self.ingest_alertmanager)
+        self._route("POST", "/v1/ingest/alerts", integration, self.ingest_generic)
         self._route("POST", "/v1/agent/actions", agent, self.agent_submit)
         self._route("GET", "/v1/agent/actions/{id}", agent, self.agent_get)
         self._route("GET", "/v1/agent/me", agent, self.agent_me)
@@ -127,6 +133,8 @@ class ControlAPI:
         self._route("POST", "/v1/incidents/{id}/status", user, self.incident_status)
         self._route("POST", "/v1/incidents/{id}/update", user, self.update_incident)
         self._route("GET", "/v1/incidents/{id}/evidence", user, self.incident_evidence)
+        self._route("GET", "/v1/silences", user, self.list_silences)
+        self._route("POST", "/v1/silences", user, self.add_silence)
 
     def _route(self, method: str, template: str, kind: PrincipalKind, handler: Handler) -> None:
         pattern = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[A-Za-z0-9_.:-]+)", template) + "$")
@@ -164,6 +172,8 @@ class ControlAPI:
                     raise HTTPError(404, str(exc.args[0])) from None
                 except ApprovalError as exc:
                     raise HTTPError(409, str(exc)) from None
+                except AlertError as exc:
+                    raise HTTPError(400, str(exc)) from None
                 except IncidentNotFound as exc:
                     raise HTTPError(404, str(exc)) from None
                 except IncidentConflict as exc:
@@ -294,6 +304,7 @@ class ControlAPI:
                 i.severity for i in self.incidents.all()
                 if i.status not in (IncidentStatus.RESOLVED, IncidentStatus.CLOSED)
             )),
+            "alerts_since_start": dict(self.alertmind.stats),
             "policies": len(self.gateway.policy.rules),
             "active_credentials": len(self.gateway.credentials.active()),
             "audit": {"events": len(self.gateway.audit.events()), "chain_valid": self.gateway.audit.verify()},
@@ -311,6 +322,40 @@ class ControlAPI:
             raise HTTPError(404 if str(exc).startswith("unknown") else 400, str(exc)) from None
         return FileResponse(bundle.content, "application/zip", bundle.filename,
                             {"X-Evidence-SHA256": bundle.sha256, "X-Evidence-Bundle-Id": bundle.bundle_id})
+
+    # ---- AlertMind (§21, §22) -------------------------------------------------
+
+    def ingest_alertmanager(self, req: Request) -> Any:
+        alerts = parse_alertmanager(req.json())
+        return {"results": [r.as_dict() for r in self.alertmind.ingest(alerts, actor=req.principal.id)]}
+
+    def ingest_generic(self, req: Request) -> Any:
+        alerts = parse_generic(req.json())
+        return {"results": [r.as_dict() for r in self.alertmind.ingest(alerts, actor=req.principal.id)]}
+
+    def list_silences(self, req: Request) -> Any:
+        now = utcnow()
+        return {"silences": [
+            {"name": s.name, "match": s.match, "ends_at": s.ends_at.isoformat() if s.ends_at else None,
+             "active": s.ends_at is None or now < s.ends_at}
+            for s in self.alertmind.config.silences
+        ]}
+
+    def add_silence(self, req: Request) -> Any:
+        data = req.json()
+        name, match, minutes = data.get("name"), data.get("match"), data.get("duration_minutes")
+        if not isinstance(name, str) or not name:
+            raise HTTPError(400, "name is required")
+        if not isinstance(match, dict) or not match or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in match.items()):
+            raise HTTPError(400, "match must be a non-empty object of label: value strings")
+        if not isinstance(minutes, int) or isinstance(minutes, bool) or not 1 <= minutes <= 7 * 24 * 60:
+            raise HTTPError(400, "duration_minutes must be between 1 and 10080")
+        silence = Silence(name, dict(match), utcnow() + timedelta(minutes=minutes))
+        self.alertmind.config.silences.append(silence)
+        self.gateway.audit.record("silence.created", req.principal.id, None, name=name, match=match,
+                                  ends_at=silence.ends_at.isoformat())
+        return {"name": name, "match": match, "ends_at": silence.ends_at.isoformat()}
 
     # ---- Incidents (§23, §24) -------------------------------------------------
 

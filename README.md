@@ -28,12 +28,14 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `persistence.SQLiteStore` | §26, §27 | Durable audit trail, agent identities, executions, approvals and token hashes (standard-library SQLite) |
 | `evidence` | §26, §27 | Evidence bundle export (zip with manifest of SHA-256 hashes, optional HMAC signature) and an offline verifier |
 | `incidents.IncidentManager` | §21, §23, §24 | Incidents that group alerts (de-duplicated by fingerprint) and governed executions, with a status lifecycle and a timeline read from the audit trail |
+| `alertmind.AlertMind` | §21, §22 | Alert ingestion (Alertmanager webhook, generic JSON), severity normalization, de-duplication, silences, noise threshold, and dependency-aware correlation into incidents |
 | `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
 
 ### HTTP API
 
 Standard library only, so it runs air-gapped. Every endpoint except `/healthz` needs `Authorization: Bearer <token>`.
-User tokens and agent tokens are kept apart: an agent can't call human endpoints, and a human can't submit as an agent.
+User, agent and integration tokens are kept apart: an agent can't call human endpoints, a human can't submit as an
+agent, and an integration token (for Alertmanager and similar) can only push alerts, so it can never approve an action.
 
 | Method | Path | Caller | Purpose |
 |---|---|---|---|
@@ -49,6 +51,9 @@ User tokens and agent tokens are kept apart: an agent can't call human endpoints
 | GET | `/v1/approvals` | user | Pending approvals |
 | GET | `/v1/audit[?execution_id=]`, `/v1/audit/verify` | user | Audit trail and hash-chain check |
 | GET | `/v1/evidence?execution_id=…[&execution_id=…][&title=…]` | user | Download an evidence bundle (zip). The export is itself written to the audit trail with the file's SHA-256 |
+| POST | `/v1/ingest/alertmanager` | integration | Prometheus Alertmanager webhook (v4 payload) |
+| POST | `/v1/ingest/alerts` | integration | Generic alert JSON: one alert or `{"alerts": [...]}` |
+| GET, POST | `/v1/silences` | user | List or add a silence `{name, match: {label: value}, duration_minutes}` |
 | POST | `/v1/agent/incidents` | agent | Open an incident (`detection_source` is recorded as the agent) |
 | GET | `/v1/agent/incidents/{id}` | agent | Incident with timeline |
 | POST | `/v1/agent/incidents/{id}/alerts` | agent | Attach an alert `{name, source, severity, summary, labels, fingerprint}` |
@@ -89,6 +94,40 @@ Safety rules:
 ```bash
 PYTHONPATH=. python3 examples/serve_demo.py --db aegis.db
 ```
+
+### AlertMind (§21, §22)
+
+Point Alertmanager (or anything that can POST JSON) at AlertMind with an integration token:
+
+```yaml
+# alertmanager.yml
+receivers:
+  - name: aegis
+    webhook_configs:
+      - url: https://aegis.example.internal/v1/ingest/alertmanager
+        http_config:
+          authorization: { credentials_file: /etc/alertmanager/aegis-token }
+```
+
+For each alert, in order:
+
+1. **Same alert already on an open incident:** counted as a repeat; a `resolved` alert marks it cleared.
+2. **Silenced** (maintenance window): recorded in the audit trail and dropped.
+3. **Related to an open incident:** same environment, recent activity (default 30 minutes), and the same service or
+   one linked to it through the dependency map, directly or via a chain. The alert is attached, the service is added
+   to `affected_services`, and the incident's severity is raised if the alert is more severe.
+4. **Otherwise** a new incident is opened, unless the alert is below the noise threshold (default `medium`).
+
+```python
+AlertMind(incidents, CorrelationConfig(
+    dependencies={"web": ["api"], "api": ["postgres", "rabbitmq"]},
+    window=timedelta(minutes=30),
+    min_severity_to_open="medium",
+))
+```
+
+So the spec's §22 example (database exhaustion, CPU, API timeout, queue backlog, pod restart) becomes a single incident.
+Severities from different tools (`P1`, `error`, `warning`, `info`, …) are mapped to low/medium/high/critical.
 
 ### Incidents (§23, §24)
 
@@ -191,6 +230,7 @@ This is the in-process core. Next steps toward the spec:
   access to the database could rebuild the whole chain
 - Vault dynamic secrets behind `CredentialBroker` (§51)
 - Metrics, logs, traces and topology in evidence bundles, once telemetry sources exist (§27, §42)
-- Alert ingestion from Alertmanager, Grafana and others, with automatic correlation into incidents (§21, §22)
+- Alert sources beyond Alertmanager and generic JSON (Grafana, Zabbix, Datadog, cloud alerts) as adapters (§21)
+- Dependency map from OpsGraph/CMDB discovery instead of configuration (§33, §39); silences are in memory only
 - MCP server adapters that register into the Tool Registry (§17)
 - Control Tower web UI (§54; the API summary exists)

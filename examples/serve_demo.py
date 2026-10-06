@@ -17,8 +17,10 @@ from sovereign_control import (
     SQLiteStore,
     ToolDefinition,
 )
+from sovereign_control.alertmind import AlertMind, CorrelationConfig
 from sovereign_control.api import ControlAPI, make_server
 from sovereign_control.auth import TokenAuthenticator
+from sovereign_control.incidents import IncidentManager
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--port", type=int, default=8080)
@@ -57,15 +59,33 @@ auth = TokenAuthenticator(store)
 agent_token = auth.add_agent("k8s-agent")
 sre_token = auth.add_user("alice", {"sre"})
 admin_token = auth.add_user("root", {"admin"})
+alerts_token = auth.add_integration("alertmanager")
+
+incidents = IncidentManager(gw)
+alertmind = AlertMind(incidents, CorrelationConfig(dependencies={
+    "web": ["api"], "api": ["postgres", "rabbitmq"],
+}))
 
 port = args.port
-server = make_server(ControlAPI(gw, auth, evidence_signing_key=evidence_key), "127.0.0.1", port)
+server = make_server(
+    ControlAPI(gw, auth, evidence_signing_key=evidence_key, incidents=incidents, alertmind=alertmind),
+    "127.0.0.1", port,
+)
 base = f"http://127.0.0.1:{port}"
 print(f"""Sovereign Control API on {base}
 
   AGENT={agent_token}
   SRE={sre_token}
   ADMIN={admin_token}
+  ALERTS={alerts_token}
+
+  # Alertmanager-style webhook: related alerts are grouped into one incident
+  curl -s -X POST {base}/v1/ingest/alertmanager -H "Authorization: Bearer $ALERTS" \
+    -d '{{"status":"firing","commonLabels":{{"env":"production"}},"alerts":[
+         {{"labels":{{"alertname":"PostgresConnectionsExhausted","service":"postgres","severity":"critical"}},
+          "annotations":{{"summary":"Database connection exhaustion"}}}},
+         {{"labels":{{"alertname":"APITimeout","service":"api","severity":"error"}}}},
+         {{"labels":{{"alertname":"QueueBacklog","service":"rabbitmq","severity":"warning"}}}}]}}'
 
   # agent asks to restart a crash-looping pod (production → needs approval)
   curl -s -X POST {base}/v1/agent/actions -H "Authorization: Bearer $AGENT" \\

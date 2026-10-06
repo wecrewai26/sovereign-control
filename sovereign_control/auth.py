@@ -1,8 +1,9 @@
 """Caller authentication for the HTTP API.
 
-Two kinds of principal reach the API (spec §10, §48):
+Three kinds of principal reach the API (spec §10, §48):
 - humans (operators, approvers, admins) through the API Gateway;
-- agents through the Agent Gateway, each with a token bound to its agent identity.
+- agents through the Agent Gateway, each with a token bound to its agent identity;
+- integrations (Alertmanager, monitoring tools) that may only push alerts.
 
 `TokenAuthenticator` is the built-in bearer-token implementation. Tokens are
 stored only as SHA-256 hashes. A Keycloak/OIDC authenticator can replace it by
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 class PrincipalKind(str, enum.Enum):
     USER = "user"
     AGENT = "agent"
+    INTEGRATION = "integration"
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,9 @@ class TokenAuthenticator:
 
     def add_agent(self, agent_id: str, token: str | None = None) -> str:
         return self._add(Principal(PrincipalKind.AGENT, agent_id), token)
+
+    def add_integration(self, name: str, token: str | None = None) -> str:
+        return self._add(Principal(PrincipalKind.INTEGRATION, name), token)
 
     def revoke(self, token: str) -> None:
         token_hash = _hash(token)

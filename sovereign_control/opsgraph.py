@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 IMPACT_EDGES = frozenset({"depends_on", "deployed_on", "runs_on"})
@@ -33,6 +33,10 @@ class GraphError(ValueError):
     pass
 
 
+class GraphConflict(GraphError):
+    """The change is refused as unsafe without a person's review."""
+
+
 @dataclass
 class Node:
     node_id: str
@@ -42,6 +46,7 @@ class Node:
     owner: str = ""
     customer_facing: bool = False
     attributes: dict[str, str] = field(default_factory=dict)
+    origin: str = ""  # "" = written by people; otherwise the discovery source that reported it
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,7 @@ class Edge:
     source: str
     kind: str
     target: str
+    origin: str = ""
 
 
 class OpsGraph:
@@ -65,13 +71,13 @@ class OpsGraph:
         self._nodes[node_id] = node
         return node
 
-    def add_edge(self, source: str, kind: str, target: str) -> Edge:
+    def add_edge(self, source: str, kind: str, target: str, origin: str = "") -> Edge:
         if kind not in EDGE_KINDS:
             raise GraphError(f"unknown edge kind {kind!r}; expected one of {', '.join(sorted(EDGE_KINDS))}")
         for end in (source, target):
             if end not in self._nodes:
-                self.add_node(end)  # implicit nodes keep config short; they can be described later
-        edge = Edge(source, kind, target)
+                self.add_node(end, origin=origin)  # implicit nodes keep config short; describe them later
+        edge = Edge(source, kind, target, origin)
         self._edges.add(edge)
         return edge
 
@@ -88,22 +94,22 @@ class OpsGraph:
 
     @classmethod
     def from_dict(cls, data: Any) -> "OpsGraph":
-        """{"nodes": [{"id", "kind", "name", "environment", "owner", "customer_facing", "attributes"}],
-            "edges": [{"from", "kind", "to"}]}"""
+        """{"nodes": [{"id", "kind", "name", "environment", "owner", "customer_facing", "attributes", "origin"}],
+            "edges": [{"from", "kind", "to", "origin"}]}"""
         if not isinstance(data, dict):
             raise GraphError("graph must be an object with 'nodes' and 'edges'")
         nodes, edges = data.get("nodes", []), data.get("edges", [])
         if not isinstance(nodes, list) or not isinstance(edges, list):
             raise GraphError("'nodes' and 'edges' must be lists")
         graph = cls()
-        allowed = {"id", "kind", "name", "environment", "owner", "customer_facing", "attributes"}
+        allowed = {"id", "kind", "name", "environment", "owner", "customer_facing", "attributes", "origin"}
         for raw in nodes:
             if not isinstance(raw, dict):
                 raise GraphError("each node must be an object")
             unknown = set(raw) - allowed
             if unknown:
                 raise GraphError(f"unknown node fields: {', '.join(sorted(unknown))}")
-            for key in ("kind", "name", "environment", "owner"):
+            for key in ("kind", "name", "environment", "owner", "origin"):
                 if key in raw and not isinstance(raw[key], str):
                     raise GraphError(f"node.{key} must be a string")
             if "customer_facing" in raw and not isinstance(raw["customer_facing"], bool):
@@ -116,7 +122,9 @@ class OpsGraph:
         for raw in edges:
             if not isinstance(raw, dict) or not all(isinstance(raw.get(k), str) for k in ("from", "kind", "to")):
                 raise GraphError("each edge needs string 'from', 'kind' and 'to'")
-            graph.add_edge(raw["from"], raw["kind"], raw["to"])
+            if not isinstance(raw.get("origin", ""), str):
+                raise GraphError("edge.origin must be a string")
+            graph.add_edge(raw["from"], raw["kind"], raw["to"], raw.get("origin", ""))
         return graph
 
     def to_dict(self) -> dict[str, Any]:
@@ -125,9 +133,32 @@ class OpsGraph:
             data = asdict(node)
             data["id"] = data.pop("node_id")
             nodes.append(data)
-        edges = [{"from": e.source, "kind": e.kind, "to": e.target}
-                 for e in sorted(self._edges, key=lambda e: (e.source, e.kind, e.target))]
+        edges = [{"from": e.source, "kind": e.kind, "to": e.target, **({"origin": e.origin} if e.origin else {})}
+                 for e in sorted(self._edges, key=lambda e: (e.source, e.kind, e.target, e.origin))]
         return {"nodes": nodes, "edges": edges}
+
+    def merged_with_origin(self, origin: str, discovered: "OpsGraph") -> "OpsGraph":
+        """A copy of this graph where everything previously reported by `origin` is replaced by `discovered`.
+
+        Entries written by people (origin "") and by other sources are kept. Where a person has
+        described a node, their description wins over the discovered one.
+        """
+        if not origin:
+            raise GraphError("a discovery origin is required")
+        nodes = {nid: n for nid, n in self._nodes.items() if n.origin != origin}
+        for node in discovered.nodes():
+            if node.node_id not in nodes:
+                nodes[node.node_id] = replace(node, origin=origin)
+        edges = {e for e in self._edges if e.origin != origin}
+        edges |= {replace(e, origin=origin) for e in discovered.edges()}
+        merged = OpsGraph()
+        merged._nodes = nodes
+        merged._edges = edges
+        for edge in edges:  # keep every edge's endpoints described
+            for end in (edge.source, edge.target):
+                if end not in merged._nodes:
+                    merged._nodes[end] = Node(node_id=end, origin=edge.origin)
+        return merged
 
     def replace_with(self, other: "OpsGraph") -> None:
         """Swap in another graph's contents, so every component holding this graph sees the change."""

@@ -30,6 +30,7 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `incidents.IncidentManager` | §21, §23, §24 | Incidents that group alerts (de-duplicated by fingerprint) and governed executions, with a status lifecycle and a timeline read from the audit trail |
 | `alertmind.AlertMind` | §21, §22 | Alert ingestion (Alertmanager webhook, generic JSON), severity normalization, de-duplication, silences, noise threshold, and dependency-aware correlation into incidents |
 | `opsgraph.OpsGraph` | §33 | Service and infrastructure graph: what depends on what and what runs where. Feeds blast radius into risk and dependency chains into alert correlation |
+| `discovery.kubernetes` | §39 | Read-only Kubernetes discovery: workloads, nodes and placement, plus declared dependencies, reported into the OpsGraph |
 | `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
 
 ### HTTP API
@@ -56,6 +57,7 @@ agent, and an integration token (for Alertmanager and similar) can only push ale
 | POST | `/v1/ingest/alerts` | integration | Generic alert JSON: one alert or `{"alerts": [...]}` |
 | GET | `/v1/opsgraph` | user | The whole graph and its fingerprint |
 | PUT | `/v1/opsgraph` | user with `admin` | Replace the graph (validated first; audited with its fingerprint; persisted) |
+| POST | `/v1/ingest/opsgraph` | integration (approved sources only) | Discovery report, merged under the source's name |
 | GET | `/v1/opsgraph/{id}/impact`, `/v1/agent/opsgraph/{id}/impact` | user, agent | What fails if this fails, what it depends on, which customer-facing services are reached |
 | GET, POST | `/v1/silences` | user | List or add a silence `{name, match: {label: value}, duration_minutes}` |
 | POST | `/v1/agent/incidents` | agent | Open an incident (`detection_source` is recorded as the agent) |
@@ -120,7 +122,33 @@ One graph is shared by:
   `NodeNotReady` on `node-7` joins the incident for the services running there.
 
 `PUT /v1/opsgraph` replaces it for everyone at once and is saved; after that the saved graph wins over the one
-passed at startup.
+passed at startup. Ids containing `/` (such as `node/ip-10-0-1-7`) are URL-encoded in paths: `node%2Fip-10-0-1-7`.
+
+### Kubernetes discovery (§39)
+
+A job in the cluster reads nodes, pods, services and workloads (Deployments, StatefulSets, DaemonSets) with a
+read-only service account and reports them to AEGIS:
+
+- **Placement:** each workload is `deployed_on` the nodes its pods are scheduled on, so a node failure reaches the
+  services on it.
+- **Ids line up with alerts:** a workload's id is its `app.kubernetes.io/name` label, else `app`, else its name;
+  the same id in two namespaces becomes `<namespace>/<id>`.
+- **Dependencies are declared**, since Kubernetes doesn't know who calls whom, with annotations on the workload:
+  `aegis.wecrew.ai/depends-on: "postgres, payments-rds"` (Service names resolve to the workloads behind them;
+  other names, such as a managed database, are used as-is), `aegis.wecrew.ai/customer-facing: "true"`, and
+  `aegis.wecrew.ai/owner`.
+
+[`deploy/kubernetes/opsgraph-discovery.yaml`](deploy/kubernetes/opsgraph-discovery.yaml) has the read-only RBAC
+and a CronJob. To try it without a cluster: `python3 -m sovereign_control.discovery.kubernetes --from-file dump.json`.
+
+Because the graph raises risk scores, discovery is governed too:
+- Only integrations listed in `ControlAPI(graph_sources={...})` may report; alert senders can't.
+- Each source's entries are tagged with its name and replaced as a set on every report. Entries people wrote, and
+  other sources' entries, are never touched, and a person's description of a node wins over the discovered one.
+  A source can't mark its entries as hand-written.
+- A report that would remove more than half of that source's edges is refused (409) and recorded in the audit
+  trail, so a broken or compromised job can't quietly strip out dependencies and lower risk scores. An admin can
+  apply it with `PUT /v1/opsgraph` after review.
 
 ### AlertMind (§21, §22)
 
@@ -258,7 +286,7 @@ This is the in-process core. Next steps toward the spec:
 - Vault dynamic secrets behind `CredentialBroker` (§51)
 - Metrics, logs, traces and topology in evidence bundles, once telemetry sources exist (§27, §42)
 - Alert sources beyond Alertmanager and generic JSON (Grafana, Zabbix, Datadog, cloud alerts) as adapters (§21)
-- Populating the OpsGraph automatically from Kubernetes, VMware, cloud APIs and SNMP/LLDP discovery (§39), and
-  ChangeGraph (§34); today it's loaded from JSON. Silences are in memory only
+- Discovery beyond Kubernetes (VMware, Proxmox, cloud APIs, SNMP/LLDP, Redfish) and ChangeGraph (§34, §39);
+  service-mesh or tracing data to find dependencies without annotations. Silences are in memory only
 - MCP server adapters that register into the Tool Registry (§17)
 - Control Tower web UI (§54; the API summary exists)

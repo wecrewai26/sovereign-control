@@ -69,13 +69,15 @@ agent_token = auth.add_agent("k8s-agent")
 sre_token = auth.add_user("alice", {"sre"})
 admin_token = auth.add_user("root", {"admin"})
 alerts_token = auth.add_integration("alertmanager")
+discovery_token = auth.add_integration("k8s-discovery")
 
 incidents = IncidentManager(gw)
 alertmind = AlertMind(incidents, CorrelationConfig(graph=gw.graph))
 
 port = args.port
 server = make_server(
-    ControlAPI(gw, auth, evidence_signing_key=evidence_key, incidents=incidents, alertmind=alertmind),
+    ControlAPI(gw, auth, evidence_signing_key=evidence_key, incidents=incidents, alertmind=alertmind,
+               graph_sources={"k8s-discovery"}),
     "127.0.0.1", port,
 )
 base = f"http://127.0.0.1:{port}"
@@ -85,6 +87,12 @@ print(f"""Sovereign Control API on {base}
   SRE={sre_token}
   ADMIN={admin_token}
   ALERTS={alerts_token}
+  DISCOVERY={discovery_token}
+
+  # report a Kubernetes cluster into the OpsGraph (here from a JSON dump; use --in-cluster in a real cluster)
+  echo $DISCOVERY > discovery.token
+  python3 -m sovereign_control.discovery.kubernetes --from-file cluster.json --environment production \
+    --push {base} --token-file discovery.token
 
   # Alertmanager-style webhook: related alerts are grouped into one incident
   curl -s -X POST {base}/v1/ingest/alertmanager -H "Authorization: Bearer $ALERTS" \

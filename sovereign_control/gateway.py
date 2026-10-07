@@ -19,7 +19,7 @@ from .credentials import CredentialBroker
 from .models import ActionContext, Decision
 from .policy import PolicyEngine, PolicyResult
 from .registry import AgentRegistry, ToolRegistry
-from .opsgraph import OpsGraph
+from .opsgraph import GraphConflict, OpsGraph
 from .risk import RiskAssessment, RiskEngine
 
 if TYPE_CHECKING:
@@ -296,6 +296,33 @@ class SovereignGateway:
         self.audit.record("opsgraph.replaced", actor, None, fingerprint=fingerprint,
                           nodes=len(self.graph.nodes()), edges=len(self.graph.edges()))
         return fingerprint
+
+    def merge_discovered_graph(
+        self, origin: str, discovered: OpsGraph, *, max_edge_removal: float = 0.5
+    ) -> dict[str, Any]:
+        """Replace what `origin` previously reported with `discovered`, keeping everything else.
+
+        Removing edges lowers blast radius and so lowers risk scores. A submission that would
+        remove more than `max_edge_removal` of this source's edges is refused; an admin can
+        apply it with a full replace instead.
+        """
+        before = {(e.source, e.kind, e.target) for e in self.graph.edges() if e.origin == origin}
+        after = {(e.source, e.kind, e.target) for e in discovered.edges()}
+        removed, added = before - after, after - before
+        if before and len(removed) / len(before) > max_edge_removal:
+            self.audit.record("opsgraph.discovery_refused", origin, None, removed_edges=len(removed),
+                              previous_edges=len(before), reason="too many edges removed at once")
+            raise GraphConflict(
+                f"refused: this would remove {len(removed)} of {len(before)} edges from {origin}; "
+                "an admin must review and apply it with PUT /v1/opsgraph")
+        self.graph.replace_with(self.graph.merged_with_origin(origin, discovered))
+        if self.store:
+            self.store.save_document(OPSGRAPH_KEY, self.graph.to_dict())
+        stats = {"origin": origin, "fingerprint": self.graph.fingerprint(), "edges_added": len(added),
+                 "edges_removed": len(removed), "nodes": len(self.graph.nodes()), "edges": len(self.graph.edges())}
+        self.audit.record("opsgraph.discovered", origin, None, **stats,
+                          removed=sorted(f"{s} {k} {t}" for s, k, t in removed)[:50])
+        return stats
 
     def _save(self, execution: Execution) -> None:
         if self.store:

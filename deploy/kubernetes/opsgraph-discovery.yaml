@@ -1,0 +1,87 @@
+# AEGIS OpsGraph discovery (spec §39): a read-only job that maps this cluster's
+# workloads and nodes and reports them to AEGIS every 10 minutes.
+#
+# Before applying:
+#   1. Create an integration token in AEGIS named "k8s-prod-discovery" and list that name
+#      in ControlAPI(graph_sources={...}).
+#   2. kubectl -n aegis create secret generic aegis-discovery-token --from-literal=token=<token>
+#   3. Build an image containing this repository (or mount it) and set `image:` below.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aegis
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opsgraph-discovery
+  namespace: aegis
+---
+# Read-only: get/list only, and only the resources discovery uses. No secrets, no writes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aegis-opsgraph-discovery
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aegis-opsgraph-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aegis-opsgraph-discovery
+subjects:
+  - kind: ServiceAccount
+    name: opsgraph-discovery
+    namespace: aegis
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: opsgraph-discovery
+  namespace: aegis
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          serviceAccountName: opsgraph-discovery
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: discovery
+              image: registry.example.internal/aegis/sovereign-control:latest  # set this
+              command:
+                - python3
+                - -m
+                - sovereign_control.discovery.kubernetes
+                - --in-cluster
+                - --environment=production
+                - --cluster=prod-eu-1
+                - --push=https://aegis.example.internal
+                - --token-file=/var/run/secrets/aegis/token
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - name: aegis-token
+                  mountPath: /var/run/secrets/aegis
+                  readOnly: true
+          volumes:
+            - name: aegis-token
+              secret:
+                secretName: aegis-discovery-token

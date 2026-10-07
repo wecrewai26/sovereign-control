@@ -17,7 +17,7 @@ from collections import Counter
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import serialize
 from .alertmind import AlertError, AlertMind, CorrelationConfig, Silence, parse_alertmanager, parse_generic
@@ -34,7 +34,7 @@ from .incidents import (
 from .auth import Authenticator, Principal, PrincipalKind
 from .gateway import ExecutionStatus, SovereignGateway
 from .models import RiskLevel, utcnow
-from .opsgraph import GraphError, OpsGraph
+from .opsgraph import GraphConflict, GraphError, OpsGraph
 from .registry import RegistryError
 
 MAX_BODY_BYTES = 1_000_000
@@ -93,10 +93,13 @@ class ControlAPI:
         evidence_signing_key: bytes | None = None,
         incidents: IncidentManager | None = None,
         alertmind: AlertMind | None = None,
+        graph_sources: set[str] | None = None,
     ) -> None:
         self.gateway = gateway
         self.incidents = incidents or IncidentManager(gateway)
         self.alertmind = alertmind or AlertMind(self.incidents, CorrelationConfig(graph=gateway.graph))
+        # Integrations allowed to report OpsGraph entries (by integration name). Others can only push alerts.
+        self.graph_sources = set(graph_sources or ())
         self.auth = authenticator
         self.evidence_signing_key = evidence_signing_key
         # The governance core is not thread-safe; serialize access to it.
@@ -106,6 +109,7 @@ class ControlAPI:
         agent, user, integration = PrincipalKind.AGENT, PrincipalKind.USER, PrincipalKind.INTEGRATION
         self._route("POST", "/v1/ingest/alertmanager", integration, self.ingest_alertmanager)
         self._route("POST", "/v1/ingest/alerts", integration, self.ingest_generic)
+        self._route("POST", "/v1/ingest/opsgraph", integration, self.ingest_graph)
         self._route("POST", "/v1/agent/actions", agent, self.agent_submit)
         self._route("GET", "/v1/agent/actions/{id}", agent, self.agent_get)
         self._route("GET", "/v1/agent/me", agent, self.agent_me)
@@ -142,7 +146,9 @@ class ControlAPI:
         self._route("POST", "/v1/silences", user, self.add_silence)
 
     def _route(self, method: str, template: str, kind: PrincipalKind, handler: Handler) -> None:
-        pattern = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[A-Za-z0-9_.:-]+)", template) + "$")
+        # A path parameter is one URL segment; ids containing "/" (e.g. "node/ip-10-0-1-7") are sent
+        # URL-encoded ("node%2Fip-10-0-1-7") and decoded before the handler sees them.
+        pattern = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[A-Za-z0-9_.:%-]+)", template) + "$")
         self._routes.append((method, pattern, kind, handler))
 
     def handle(self, method: str, target: str, headers: dict[str, str], body: bytes = b"") -> Response:
@@ -169,13 +175,16 @@ class ControlAPI:
             principal = self._authenticate(headers)
             if principal.kind is not kind:
                 raise HTTPError(403, f"endpoint requires a {kind.value} credential")
-            request = Request(principal, m.groupdict(), parse_qs(url.query), body)
+            params = {k: unquote(v) for k, v in m.groupdict().items()}
+            request = Request(principal, params, parse_qs(url.query), body)
             with self._lock:
                 try:
                     return handler(request)
                 except RegistryError as exc:
                     raise HTTPError(404, str(exc.args[0])) from None
                 except ApprovalError as exc:
+                    raise HTTPError(409, str(exc)) from None
+                except GraphConflict as exc:
                     raise HTTPError(409, str(exc)) from None
                 except (AlertError, GraphError) as exc:
                     raise HTTPError(400, str(exc)) from None
@@ -339,6 +348,13 @@ class ControlAPI:
         graph = OpsGraph.from_dict(req.json())  # validate fully before replacing anything
         fingerprint = self.gateway.replace_graph(graph, actor=req.principal.id)
         return {"fingerprint": fingerprint, "nodes": len(graph.nodes()), "edges": len(graph.edges())}
+
+    def ingest_graph(self, req: Request) -> Any:
+        """Discovery sources report what they see; it is merged under their name (spec §39)."""
+        if req.principal.id not in self.graph_sources:
+            raise HTTPError(403, "this integration is not an approved OpsGraph source")
+        discovered = OpsGraph.from_dict(req.json())
+        return self.gateway.merge_discovered_graph(req.principal.id, discovered)
 
     def graph_impact(self, req: Request) -> Any:
         return self.gateway.graph.impact(req.params["id"])

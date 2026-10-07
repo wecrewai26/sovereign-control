@@ -19,10 +19,14 @@ from .credentials import CredentialBroker
 from .models import ActionContext, Decision
 from .policy import PolicyEngine, PolicyResult
 from .registry import AgentRegistry, ToolRegistry
+from .opsgraph import OpsGraph
 from .risk import RiskAssessment, RiskEngine
 
 if TYPE_CHECKING:
     from .persistence import Store
+
+
+OPSGRAPH_KEY = "opsgraph"
 
 
 class ExecutionStatus(str, enum.Enum):
@@ -69,12 +73,17 @@ class SovereignGateway:
         credentials: CredentialBroker | None = None,
         audit: AuditLog | None = None,
         store: "Store | None" = None,
+        graph: OpsGraph | None = None,
     ) -> None:
         self.store = store
+        # One shared graph: the risk engine reads it, and replacing it updates everyone.
+        self.graph = graph if graph is not None else OpsGraph()
+        if store and (saved := store.load_document(OPSGRAPH_KEY)) is not None:
+            self.graph.replace_with(OpsGraph.from_dict(saved))  # an admin's saved graph wins over config
         self.tools = tools or ToolRegistry()
         self.agents = agents or AgentRegistry(store)
         self.policy = policy or PolicyEngine()
-        self.risk = risk or RiskEngine()
+        self.risk = risk or RiskEngine(self.graph)
         self.approvals = approvals or ApprovalEngine()
         self.credentials = credentials or CredentialBroker()
         self.audit = audit or AuditLog(store)
@@ -131,7 +140,8 @@ class SovereignGateway:
             confidence=ctx.confidence,
         )
         risk = self.risk.assess(tool, environment, ctx)
-        self.audit.record("risk.assessed", "risk-engine", execution_id, score=risk.score, level=risk.level.name, factors=risk.factors)
+        self.audit.record("risk.assessed", "risk-engine", execution_id, score=risk.score, level=risk.level.name,
+                          factors=risk.factors, notes=list(risk.notes))
         result = self.policy.evaluate(agent, tool, environment, ctx, risk)
         self.audit.record(
             "policy.evaluated",
@@ -276,6 +286,16 @@ class SovereignGateway:
             execution.status = ExecutionStatus.ROLLED_BACK
             self.audit.record("rollback.completed", "rollback-engine", eid)
         self._escalate(execution, "verification failed")
+
+    def replace_graph(self, graph: OpsGraph, *, actor: str) -> str:
+        """Replace the OpsGraph everywhere, persist it, and record the change."""
+        self.graph.replace_with(graph)
+        if self.store:
+            self.store.save_document(OPSGRAPH_KEY, self.graph.to_dict())
+        fingerprint = self.graph.fingerprint()
+        self.audit.record("opsgraph.replaced", actor, None, fingerprint=fingerprint,
+                          nodes=len(self.graph.nodes()), edges=len(self.graph.edges()))
+        return fingerprint
 
     def _save(self, execution: Execution) -> None:
         if self.store:

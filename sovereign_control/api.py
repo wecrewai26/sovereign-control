@@ -20,7 +20,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
 from . import serialize
-from .alertmind import AlertError, AlertMind, Silence, parse_alertmanager, parse_generic
+from .alertmind import AlertError, AlertMind, CorrelationConfig, Silence, parse_alertmanager, parse_generic
 from .approval import ApprovalError
 from .evidence import EvidenceError, build_bundle
 from .incidents import (
@@ -34,6 +34,7 @@ from .incidents import (
 from .auth import Authenticator, Principal, PrincipalKind
 from .gateway import ExecutionStatus, SovereignGateway
 from .models import RiskLevel, utcnow
+from .opsgraph import GraphError, OpsGraph
 from .registry import RegistryError
 
 MAX_BODY_BYTES = 1_000_000
@@ -95,7 +96,7 @@ class ControlAPI:
     ) -> None:
         self.gateway = gateway
         self.incidents = incidents or IncidentManager(gateway)
-        self.alertmind = alertmind or AlertMind(self.incidents)
+        self.alertmind = alertmind or AlertMind(self.incidents, CorrelationConfig(graph=gateway.graph))
         self.auth = authenticator
         self.evidence_signing_key = evidence_signing_key
         # The governance core is not thread-safe; serialize access to it.
@@ -108,6 +109,7 @@ class ControlAPI:
         self._route("POST", "/v1/agent/actions", agent, self.agent_submit)
         self._route("GET", "/v1/agent/actions/{id}", agent, self.agent_get)
         self._route("GET", "/v1/agent/me", agent, self.agent_me)
+        self._route("GET", "/v1/agent/opsgraph/{id}/impact", agent, self.graph_impact)
         self._route("POST", "/v1/agent/incidents", agent, self.open_incident)
         self._route("GET", "/v1/agent/incidents/{id}", agent, self.get_incident)
         self._route("POST", "/v1/agent/incidents/{id}/alerts", agent, self.attach_alert)
@@ -133,6 +135,9 @@ class ControlAPI:
         self._route("POST", "/v1/incidents/{id}/status", user, self.incident_status)
         self._route("POST", "/v1/incidents/{id}/update", user, self.update_incident)
         self._route("GET", "/v1/incidents/{id}/evidence", user, self.incident_evidence)
+        self._route("GET", "/v1/opsgraph", user, self.get_graph)
+        self._route("PUT", "/v1/opsgraph", user, self.put_graph)
+        self._route("GET", "/v1/opsgraph/{id}/impact", user, self.graph_impact)
         self._route("GET", "/v1/silences", user, self.list_silences)
         self._route("POST", "/v1/silences", user, self.add_silence)
 
@@ -172,7 +177,7 @@ class ControlAPI:
                     raise HTTPError(404, str(exc.args[0])) from None
                 except ApprovalError as exc:
                     raise HTTPError(409, str(exc)) from None
-                except AlertError as exc:
+                except (AlertError, GraphError) as exc:
                     raise HTTPError(400, str(exc)) from None
                 except IncidentNotFound as exc:
                     raise HTTPError(404, str(exc)) from None
@@ -322,6 +327,21 @@ class ControlAPI:
             raise HTTPError(404 if str(exc).startswith("unknown") else 400, str(exc)) from None
         return FileResponse(bundle.content, "application/zip", bundle.filename,
                             {"X-Evidence-SHA256": bundle.sha256, "X-Evidence-Bundle-Id": bundle.bundle_id})
+
+    # ---- OpsGraph (§33) ---------------------------------------------------------
+
+    def get_graph(self, req: Request) -> Any:
+        return {**self.gateway.graph.to_dict(), "fingerprint": self.gateway.graph.fingerprint()}
+
+    def put_graph(self, req: Request) -> Any:
+        if ADMIN_ROLE not in req.principal.roles:
+            raise HTTPError(403, f"requires role {ADMIN_ROLE}")
+        graph = OpsGraph.from_dict(req.json())  # validate fully before replacing anything
+        fingerprint = self.gateway.replace_graph(graph, actor=req.principal.id)
+        return {"fingerprint": fingerprint, "nodes": len(graph.nodes()), "edges": len(graph.edges())}
+
+    def graph_impact(self, req: Request) -> Any:
+        return self.gateway.graph.impact(req.params["id"])
 
     # ---- AlertMind (§21, §22) -------------------------------------------------
 

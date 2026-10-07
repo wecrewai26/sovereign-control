@@ -11,6 +11,7 @@ import argparse
 from sovereign_control import (
     AutonomyLevel,
     Decision,
+    OpsGraph,
     PolicyRule,
     RiskLevel,
     SovereignGateway,
@@ -32,7 +33,15 @@ store = SQLiteStore(args.db) if args.db else None
 
 pods = {"api-7f9": "CrashLoopBackOff", "api-2c1": "Running"}
 
-gw = SovereignGateway(store=store)
+graph = OpsGraph.from_dict({
+    "nodes": [{"id": "web", "customer_facing": True}, {"id": "api"}, {"id": "postgres", "kind": "database"},
+              {"id": "rabbitmq", "kind": "queue"}, {"id": "node-7", "kind": "node"}],
+    "edges": [{"from": "web", "kind": "depends_on", "to": "api"},
+              {"from": "api", "kind": "depends_on", "to": "postgres"},
+              {"from": "api", "kind": "depends_on", "to": "rabbitmq"},
+              {"from": "postgres", "kind": "deployed_on", "to": "node-7"}],
+})
+gw = SovereignGateway(store=store, graph=graph)
 gw.tools.register(ToolDefinition(
     tool_id="k8s.get_pods", name="List pods", version="1.0", owner="platform-team",
     description="List pods and their phase", handler=lambda params, cred: dict(pods),
@@ -62,9 +71,7 @@ admin_token = auth.add_user("root", {"admin"})
 alerts_token = auth.add_integration("alertmanager")
 
 incidents = IncidentManager(gw)
-alertmind = AlertMind(incidents, CorrelationConfig(dependencies={
-    "web": ["api"], "api": ["postgres", "rabbitmq"],
-}))
+alertmind = AlertMind(incidents, CorrelationConfig(graph=gw.graph))
 
 port = args.port
 server = make_server(
@@ -86,6 +93,9 @@ print(f"""Sovereign Control API on {base}
           "annotations":{{"summary":"Database connection exhaustion"}}}},
          {{"labels":{{"alertname":"APITimeout","service":"api","severity":"error"}}}},
          {{"labels":{{"alertname":"QueueBacklog","service":"rabbitmq","severity":"warning"}}}}]}}'
+
+  # what breaks if node-7 goes down? (also feeds the risk score of any action on these services)
+  curl -s {base}/v1/opsgraph/node-7/impact -H "Authorization: Bearer $SRE"
 
   # agent asks to restart a crash-looping pod (production → needs approval)
   curl -s -X POST {base}/v1/agent/actions -H "Authorization: Bearer $AGENT" \\

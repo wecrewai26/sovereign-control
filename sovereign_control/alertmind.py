@@ -23,6 +23,7 @@ from typing import Any
 
 from .incidents import SEVERITIES, Incident, IncidentManager, IncidentStatus
 from .models import utcnow
+from .opsgraph import OpsGraph
 
 _SEVERITY_ALIASES = {
     "critical": "critical", "crit": "critical", "page": "critical", "emergency": "critical", "p1": "critical",
@@ -80,26 +81,16 @@ class Silence:
 class CorrelationConfig:
     window: timedelta = timedelta(minutes=30)
     min_severity_to_open: str = "medium"
-    # service -> services it depends on, e.g. {"checkout": ["postgres", "rabbitmq"]}
+    # Either an OpsGraph, or a simple map of service -> services it depends on,
+    # e.g. {"checkout": ["postgres", "rabbitmq"]}. The graph wins when both are given.
+    graph: OpsGraph | None = None
     dependencies: dict[str, list[str]] = field(default_factory=dict)
     silences: list[Silence] = field(default_factory=list)
 
     def related(self, a: str, b: str) -> bool:
-        """True if one service depends on the other, directly or through a chain."""
-        if not a or not b:
-            return False
-        return a == b or self._depends_on(a, b) or self._depends_on(b, a)
-
-    def _depends_on(self, service: str, target: str) -> bool:
-        seen, stack = {service}, list(self.dependencies.get(service, []))
-        while stack:
-            current = stack.pop()
-            if current == target:
-                return True
-            if current not in seen:
-                seen.add(current)
-                stack.extend(self.dependencies.get(current, []))
-        return False
+        """True if one service depends on (or runs on) the other, directly or through a chain."""
+        graph = self.graph if self.graph is not None else OpsGraph.from_dependencies(self.dependencies)
+        return graph.related(a, b)
 
 
 @dataclass(frozen=True)

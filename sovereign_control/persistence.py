@@ -42,6 +42,8 @@ class Store(Protocol):
     def load_tokens(self) -> list[tuple[str, str, str, list[str]]]: ...
     def save_incident(self, incident: "Incident") -> None: ...
     def load_incidents(self) -> list["Incident"]: ...
+    def save_document(self, key: str, data: Any) -> None: ...
+    def load_document(self, key: str) -> Any: ...
 
 
 _SCHEMA = """
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY, data TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS executions (execution_id TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS incidents (incident_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS documents (key TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tokens (
     token_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, principal_id TEXT NOT NULL, roles TEXT NOT NULL
 );
@@ -71,6 +74,10 @@ class SQLiteStore:
     def _write(self, sql: str, args: tuple[Any, ...]) -> None:
         with self._lock:
             self._db.execute(sql, args)
+
+    def _rows_args(self, sql: str, args: tuple[Any, ...]) -> list[tuple[Any, ...]]:
+        with self._lock:
+            return self._db.execute(sql, args).fetchall()
 
     def _rows(self, sql: str) -> Iterator[tuple[Any, ...]]:
         with self._lock:
@@ -122,6 +129,17 @@ class SQLiteStore:
     def load_tokens(self) -> list[tuple[str, str, str, list[str]]]:
         rows = self._rows("SELECT token_hash, kind, principal_id, roles FROM tokens")
         return [(h, k, p, json.loads(r)) for h, k, p, r in rows]
+
+    # named documents (configuration such as the OpsGraph)
+    def save_document(self, key: str, data: Any) -> None:
+        self._write(
+            "INSERT INTO documents (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data",
+            (key, _dumps(data)),
+        )
+
+    def load_document(self, key: str) -> Any:
+        rows = list(self._rows_args("SELECT data FROM documents WHERE key = ?", (key,)))
+        return json.loads(rows[0][0]) if rows else None
 
     # incidents
     def save_incident(self, incident: "Incident") -> None:
@@ -223,7 +241,8 @@ def execution_to_dict(e: "Execution") -> dict[str, Any]:
         "environment": e.environment,
         "params": e.params,
         "context": asdict(e.context),
-        "risk": {"score": e.risk.score, "level": e.risk.level.name, "factors": e.risk.factors},
+        "risk": {"score": e.risk.score, "level": e.risk.level.name, "factors": e.risk.factors,
+                 "notes": list(e.risk.notes)},
         "policy": {
             "decision": e.policy.decision.name,
             "reasons": list(e.policy.reasons),
@@ -252,7 +271,8 @@ def execution_from_dict(d: dict[str, Any]) -> "Execution":
         environment=d["environment"],
         params=d["params"],
         context=ActionContext(**d["context"]),
-        risk=RiskAssessment(score=d["risk"]["score"], level=RiskLevel[d["risk"]["level"]], factors=d["risk"]["factors"]),
+        risk=RiskAssessment(score=d["risk"]["score"], level=RiskLevel[d["risk"]["level"]], factors=d["risk"]["factors"],
+                            notes=tuple(d["risk"].get("notes", ()))),
         policy=PolicyResult(
             decision=Decision[policy["decision"]],
             reasons=tuple(policy["reasons"]),

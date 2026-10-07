@@ -215,7 +215,8 @@ def _remediation(x: Execution) -> dict[str, Any]:
         "environment": x.environment,
         "params": x.params,
         "status": x.status.value,
-        "risk": {"score": x.risk.score, "level": x.risk.level.name, "factors": x.risk.factors},
+        "risk": {"score": x.risk.score, "level": x.risk.level.name, "factors": x.risk.factors,
+                 "notes": list(x.risk.notes)},
         "policy": {
             "decision": x.policy.decision.name,
             "reasons": list(x.policy.reasons),

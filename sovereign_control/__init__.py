@@ -15,6 +15,7 @@ from .models import (
     RiskLevel,
     ToolDefinition,
 )
+from .opsgraph import OpsGraph
 from .persistence import SQLiteStore, Store
 from .policy import PolicyEngine, PolicyResult, PolicyRule
 from .registry import AgentRegistry, RegistryError, ToolRegistry
@@ -40,6 +41,7 @@ __all__ = [
     "IncidentError",
     "IncidentManager",
     "IncidentStatus",
+    "OpsGraph",
     "PolicyEngine",
     "PolicyResult",
     "PolicyRule",

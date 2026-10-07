@@ -78,7 +78,8 @@ def execution(e: Execution) -> dict[str, Any]:
         "params": e.params,
         "context": asdict(e.context),
         "status": e.status.value,
-        "risk": {"score": e.risk.score, "level": e.risk.level.name, "factors": e.risk.factors},
+        "risk": {"score": e.risk.score, "level": e.risk.level.name, "factors": e.risk.factors,
+                 "notes": list(e.risk.notes)},
         "policy": {
             "decision": e.policy.decision.name,
             "reasons": list(e.policy.reasons),

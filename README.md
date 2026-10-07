@@ -29,6 +29,7 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `evidence` | §26, §27 | Evidence bundle export (zip with manifest of SHA-256 hashes, optional HMAC signature) and an offline verifier |
 | `incidents.IncidentManager` | §21, §23, §24 | Incidents that group alerts (de-duplicated by fingerprint) and governed executions, with a status lifecycle and a timeline read from the audit trail |
 | `alertmind.AlertMind` | §21, §22 | Alert ingestion (Alertmanager webhook, generic JSON), severity normalization, de-duplication, silences, noise threshold, and dependency-aware correlation into incidents |
+| `opsgraph.OpsGraph` | §33 | Service and infrastructure graph: what depends on what and what runs where. Feeds blast radius into risk and dependency chains into alert correlation |
 | `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
 
 ### HTTP API
@@ -53,6 +54,9 @@ agent, and an integration token (for Alertmanager and similar) can only push ale
 | GET | `/v1/evidence?execution_id=…[&execution_id=…][&title=…]` | user | Download an evidence bundle (zip). The export is itself written to the audit trail with the file's SHA-256 |
 | POST | `/v1/ingest/alertmanager` | integration | Prometheus Alertmanager webhook (v4 payload) |
 | POST | `/v1/ingest/alerts` | integration | Generic alert JSON: one alert or `{"alerts": [...]}` |
+| GET | `/v1/opsgraph` | user | The whole graph and its fingerprint |
+| PUT | `/v1/opsgraph` | user with `admin` | Replace the graph (validated first; audited with its fingerprint; persisted) |
+| GET | `/v1/opsgraph/{id}/impact`, `/v1/agent/opsgraph/{id}/impact` | user, agent | What fails if this fails, what it depends on, which customer-facing services are reached |
 | GET, POST | `/v1/silences` | user | List or add a silence `{name, match: {label: value}, duration_minutes}` |
 | POST | `/v1/agent/incidents` | agent | Open an incident (`detection_source` is recorded as the agent) |
 | GET | `/v1/agent/incidents/{id}` | agent | Incident with timeline |
@@ -95,6 +99,29 @@ Safety rules:
 PYTHONPATH=. python3 examples/serve_demo.py --db aegis.db
 ```
 
+### OpsGraph (§33)
+
+```json
+{"nodes": [{"id": "web", "customer_facing": true}, {"id": "postgres", "kind": "database"}, {"id": "node-7", "kind": "node"}],
+ "edges": [{"from": "web", "kind": "depends_on", "to": "api"},
+           {"from": "api", "kind": "depends_on", "to": "postgres"},
+           {"from": "postgres", "kind": "deployed_on", "to": "node-7"}]}
+```
+
+`depends_on`, `deployed_on` and `runs_on` carry impact (if the target fails, the source is affected). Other spec
+relationships (`owns`, `monitors`, `managed_by`, …) are recorded without propagating impact.
+
+One graph is shared by:
+- **Risk (§52).** When an agent names a `service`, its blast radius is the larger of the agent's claim and the graph's
+  count of affected services, and customer impact is set if a customer-facing service is reached. An agent can
+  overstate risk but never understate it. The reasons appear in the risk `notes` (audit trail, API, evidence bundles),
+  including a note when the service is missing from the graph.
+- **AlertMind (§22).** Alerts are related when one is in the other's dependency chain, including placement, so a
+  `NodeNotReady` on `node-7` joins the incident for the services running there.
+
+`PUT /v1/opsgraph` replaces it for everyone at once and is saved; after that the saved graph wins over the one
+passed at startup.
+
 ### AlertMind (§21, §22)
 
 Point Alertmanager (or anything that can POST JSON) at AlertMind with an integration token:
@@ -114,7 +141,7 @@ For each alert, in order:
 1. **Same alert already on an open incident:** counted as a repeat; a `resolved` alert marks it cleared.
 2. **Silenced** (maintenance window): recorded in the audit trail and dropped.
 3. **Related to an open incident:** same environment, recent activity (default 30 minutes), and the same service or
-   one linked to it through the dependency map, directly or via a chain. The alert is attached, the service is added
+   one linked to it in the OpsGraph (or a simple dependency map), directly or via a chain. The alert is attached, the service is added
    to `affected_services`, and the incident's severity is raised if the alert is more severe.
 4. **Otherwise** a new incident is opened, unless the alert is below the noise threshold (default `medium`).
 
@@ -231,6 +258,7 @@ This is the in-process core. Next steps toward the spec:
 - Vault dynamic secrets behind `CredentialBroker` (§51)
 - Metrics, logs, traces and topology in evidence bundles, once telemetry sources exist (§27, §42)
 - Alert sources beyond Alertmanager and generic JSON (Grafana, Zabbix, Datadog, cloud alerts) as adapters (§21)
-- Dependency map from OpsGraph/CMDB discovery instead of configuration (§33, §39); silences are in memory only
+- Populating the OpsGraph automatically from Kubernetes, VMware, cloud APIs and SNMP/LLDP discovery (§39), and
+  ChangeGraph (§34); today it's loaded from JSON. Silences are in memory only
 - MCP server adapters that register into the Tool Registry (§17)
 - Control Tower web UI (§54; the API summary exists)

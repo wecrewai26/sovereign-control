@@ -9,6 +9,7 @@ Every step is written to the audit log. An agent never calls a tool directly.
 from __future__ import annotations
 
 import enum
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,26 @@ if TYPE_CHECKING:
 
 
 OPSGRAPH_KEY = "opsgraph"
+REDACTED = "[REDACTED]"
+
+
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def _redact(value: Any, secrets: list[str]) -> Any:
+    """Replace any secret string a tool echoed back, so it never reaches the audit trail or storage."""
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, REDACTED)
+        return value
+    if isinstance(value, dict):
+        return {k: _redact(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact(v, secrets) for v in value]
+    return value
 
 
 class ExecutionStatus(str, enum.Enum):
@@ -230,14 +251,25 @@ class SovereignGateway:
         # Persist before touching infrastructure so a crash mid-action is visible on restart.
         execution.status = ExecutionStatus.EXECUTING
         self._save(execution)
-        cred = self.credentials.issue(execution.agent_id, tool.tool_id, execution.environment)
-        self.audit.record("credential.issued", "credential-broker", eid, expires_at=cred.expires_at.isoformat())
+        try:
+            cred = self.credentials.issue(execution.agent_id, tool.tool_id, execution.environment,
+                                          params=execution.params)
+        except Exception as exc:  # noqa: BLE001 - no credential means the action must not run
+            execution.status = ExecutionStatus.EXECUTION_FAILED
+            execution.error = f"credential could not be issued: {type(exc).__name__}: {exc}"
+            self.audit.record("credential.failed", "credential-broker", eid, error=execution.error)
+            self._escalate(execution, "no credential; action not taken")
+            return
+        self.audit.record("credential.issued", "credential-broker", eid, source=cred.source,
+                          expires_at=cred.expires_at.isoformat(),
+                          lease=_fingerprint(cred.lease_id) if cred.lease_id else None)
+        secrets_in_use = cred.secret_values()
         try:
             try:
-                execution.result = tool.handler(execution.params, cred)
+                execution.result = _redact(tool.handler(execution.params, cred), secrets_in_use)
             except Exception as exc:  # noqa: BLE001 - tool failures are data, not crashes
                 execution.status = ExecutionStatus.EXECUTION_FAILED
-                execution.error = f"{type(exc).__name__}: {exc}"
+                execution.error = _redact(f"{type(exc).__name__}: {exc}", secrets_in_use)
                 self.audit.record("tool.failed", execution.agent_id, eid, error=execution.error)
                 self._escalate(execution, "execution failed")
                 return
@@ -255,8 +287,12 @@ class SovereignGateway:
                 return
             self._rollback(execution, cred)
         finally:
-            self.credentials.revoke(cred)
-            self.audit.record("credential.revoked", "credential-broker", eid)
+            try:
+                self.credentials.revoke(cred)
+                self.audit.record("credential.revoked", "credential-broker", eid)
+            except Exception as exc:  # noqa: BLE001 - the lease still expires at its TTL
+                self.audit.record("credential.revoke_failed", "credential-broker", eid,
+                                  error=f"{type(exc).__name__}: {exc}", expires_at=cred.expires_at.isoformat())
 
     def _verify(self, execution: Execution, verifier) -> bool:
         try:

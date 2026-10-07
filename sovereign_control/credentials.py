@@ -1,17 +1,23 @@
 """Credential broker (spec §51).
 
-Agents never hold standing credentials. A short-lived token scoped to one
+Agents never hold standing credentials. A short-lived credential scoped to one
 agent, tool and environment is minted per execution and revoked afterwards.
-A production deployment would back this with Vault dynamic secrets; the
-interface stays the same.
+
+`CredentialBroker` mints local placeholder tokens (development and tests).
+`sovereign_control.vault.VaultCredentialBroker` issues real dynamic secrets.
 """
 
 from __future__ import annotations
 
 import secrets
 from datetime import timedelta
+from typing import Any
 
 from .models import Credential, utcnow
+
+
+class CredentialError(RuntimeError):
+    """A credential could not be issued; the action must not run."""
 
 
 class CredentialBroker:
@@ -19,7 +25,14 @@ class CredentialBroker:
         self.ttl = ttl
         self._issued: dict[str, Credential] = {}
 
-    def issue(self, agent_id: str, tool_id: str, environment: str, ttl: timedelta | None = None) -> Credential:
+    def issue(
+        self,
+        agent_id: str,
+        tool_id: str,
+        environment: str,
+        ttl: timedelta | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Credential:
         now = utcnow()
         cred = Credential(
             token=secrets.token_urlsafe(24),

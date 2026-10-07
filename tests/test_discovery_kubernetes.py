@@ -127,7 +127,7 @@ class FakeKubeAPI(BaseHTTPRequestHandler):
 class ClientTests(unittest.TestCase):
     def setUp(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeKubeAPI)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def tearDown(self):

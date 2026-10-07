@@ -152,6 +152,30 @@ class Credential:
     issued_at: datetime
     expires_at: datetime
     revoked: bool = False
+    source: str = "local"
+    # The secret material a tool needs (e.g. a Vault-issued service account token). It lives
+    # only in memory for one execution and is never written to the audit trail or storage.
+    secret: dict[str, Any] = field(default_factory=dict, repr=False)
+    lease_id: str = field(default="", repr=False)
+
+    def secret_values(self) -> list[str]:
+        """Every secret string, for redacting tool output."""
+        found: list[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, str) and len(value) >= 8:
+                found.append(value)
+            elif isinstance(value, dict):
+                for v in value.values():
+                    walk(v)
+            elif isinstance(value, (list, tuple)):
+                for v in value:
+                    walk(v)
+
+        walk(self.secret)
+        if len(self.token) >= 8:
+            found.append(self.token)
+        return found
 
     def is_valid(self, now: datetime | None = None) -> bool:
         return not self.revoked and (now or utcnow()) < self.expires_at

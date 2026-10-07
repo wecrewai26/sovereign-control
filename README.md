@@ -20,7 +20,8 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `risk.RiskEngine` | §52 | Explainable 0–100 score from environment, action type, blast radius, data sensitivity, irreversibility, customer impact, confidence |
 | `policy.PolicyEngine` | §4.4, §4.5, §49 | Default-deny guardrails + L0–L5 autonomy baseline + declarative rules. Rules can only tighten, never loosen |
 | `approval.ApprovalEngine` | §53 | Single / dual / manager / service-owner / security / CAB modes; no self-approval; distinct approvers; expiry |
-| `credentials.CredentialBroker` | §51 | Short-lived credential per execution, scoped to agent + tool + environment, revoked afterwards |
+| `credentials.CredentialBroker` | §51 | Short-lived credential per execution, scoped to agent + tool + environment, revoked afterwards (local placeholder tokens, for development) |
+| `vault.VaultCredentialBroker` | §51 | Real dynamic credentials from HashiCorp Vault (Kubernetes, database, cloud secrets engines), revoked after each action |
 | `gateway.SovereignGateway` | §19, §28, §29 | Orchestrates the flow; verifies after action, rolls back on failure, escalates to a human |
 | `audit.AuditLog` | §26, §27 | Append-only SHA-256 hash chain; `verify()` detects edits, insertions and deletions |
 
@@ -230,6 +231,38 @@ when signed, that the manifest came from a holder of the key. Each export is rec
 bundle's SHA-256, so a bundle can be matched to the system's own record of producing it. Metrics, logs and traces
 will be added to bundles once telemetry sources are connected.
 
+### Vault credentials (§51)
+
+```python
+from sovereign_control.vault import AppRoleAuth, VaultClient, VaultCredentialBroker, VaultCredentialSpec
+
+vault = VaultClient("https://vault.example.internal:8200", AppRoleAuth(role_id, secret_id))
+gw = SovereignGateway(store=store, credentials=VaultCredentialBroker(vault, {
+    "k8s.restart_pod": VaultCredentialSpec("kubernetes/creds/{environment}-pod-restarter",
+                                           data={"kubernetes_namespace": "{param:namespace}"},
+                                           ttl=timedelta(minutes=5)),
+    "db.kill_query": VaultCredentialSpec("database/creds/{environment}-dba", method="GET"),
+}))
+```
+
+Only after policy and approval does AEGIS ask Vault for a credential. The tool reads it from `cred.secret` (for
+example `cred.secret["service_account_token"]`), and the lease is revoked as soon as the action, its check and any
+rollback finish. AEGIS logs in with a token, AppRole or Kubernetes auth, and logs in again if its session expires.
+
+- **Fails closed.** If a tool has no Vault mapping, Vault is down or sealed, or AEGIS's login is refused, there is no
+  credential and the action doesn't run; it's marked failed and escalated.
+- **Dynamic secrets only.** A response with no lease or TTL (a static KV secret) is refused.
+- **Agents can't redirect requests.** Placeholders are filled only from the environment, agent, tool and named
+  parameters, and parameter values must be plain names, so `"../../sys/raw"` is refused before anything is sent.
+- **Secrets stay out of records.** The audit trail gets the credential's source path and a fingerprint of the lease,
+  not the secret. If a tool echoes a secret in its result or error, it's replaced with `[REDACTED]` before being
+  recorded or stored.
+- **Revocation failures are recorded,** with the lease's expiry, rather than failing an action that already happened.
+
+The Vault role behind each path is the real permission boundary (which namespaces, which verbs, the max TTL).
+[`deploy/vault/aegis-broker.hcl`](deploy/vault/aegis-broker.hcl) is a least-privilege policy for AEGIS's own Vault
+identity: it can generate those credentials and revoke leases, nothing else.
+
 ### Autonomy levels (§4.5)
 
 | Level | Mutating tools |
@@ -283,7 +316,6 @@ This is the in-process core. Next steps toward the spec:
 - TLS termination (put the API behind a reverse proxy until then)
 - Signing or external anchoring of the audit chain: the hash chain catches partial edits, but someone with write
   access to the database could rebuild the whole chain
-- Vault dynamic secrets behind `CredentialBroker` (§51)
 - Metrics, logs, traces and topology in evidence bundles, once telemetry sources exist (§27, §42)
 - Alert sources beyond Alertmanager and generic JSON (Grafana, Zabbix, Datadog, cloud alerts) as adapters (§21)
 - Discovery beyond Kubernetes (VMware, Proxmox, cloud APIs, SNMP/LLDP, Redfish) and ChangeGraph (§34, §39);

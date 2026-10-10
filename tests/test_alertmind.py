@@ -56,6 +56,43 @@ class ParsingTests(unittest.TestCase):
                          ["critical", "high", "medium", "low", "medium", "medium"])
 
 
+def host_alert(name, ip, severity, **labels):
+    """Shaped like a real node-exporter/windows-exporter alert with no service label (hosts/IPs anonymised)."""
+    return {"status": "firing", "fingerprint": f"fp-{name}-{ip}",
+            "labels": {"alertname": f"{name}-{ip}", "instance": f"{ip}:9100", "groupname": "CPU",
+                       "severity": severity, "state": severity, "isEvent": "True", **labels},
+            "annotations": {"summary": f"Instance {ip}:9100 {name}"}}
+
+
+class RealWorldPayloadTests(unittest.TestCase):
+    def setUp(self):
+        self.gw = SovereignGateway()
+        self.im = IncidentManager(self.gw)
+        self.mind = AlertMind(self.im)
+
+    def test_ok_notifications_sent_as_firing_open_nothing(self):
+        alerts = parse_alertmanager({"version": "4", "status": "firing", "alerts": [
+            host_alert("CPUOk", "10.0.0.56", "Ok"), host_alert("CPUOk", "10.0.0.71", "Ok"),
+            host_alert("MEMOk", "10.0.0.56", "Ok", job="node-exporter", node="node-a")]})
+        self.assertEqual({a.status for a in alerts}, {"resolved"})
+        results = self.mind.ingest(alerts, actor="alertmanager")
+        self.assertEqual({r.action for r in results}, {"ignored"})
+        self.assertEqual(self.im.all(), [])
+
+    def test_hosts_are_not_merged_by_scrape_job(self):
+        alerts = parse_alertmanager({"alerts": [
+            host_alert("CPUHigh", "10.0.0.56", "critical", job="node-exporter"),
+            host_alert("CPUHigh", "10.0.0.71", "critical", job="node-exporter"),
+            host_alert("MEMHigh", "10.0.0.77", "critical", job="node-exporter", node="node-c")]})
+        self.assertEqual([a.service for a in alerts], ["10.0.0.56", "10.0.0.71", "node-c"])
+        results = self.mind.ingest(alerts, actor="alertmanager")
+        self.assertEqual([r.action for r in results], ["opened", "opened", "opened"])
+
+    def test_generic_ok_is_a_recovery(self):
+        [a] = parse_generic({"name": "DiskOk", "severity": "OK", "service": "db"})
+        self.assertEqual(a.status, "resolved")
+
+
 class DependencyTests(unittest.TestCase):
     def test_related_follows_chains_both_ways_but_not_siblings(self):
         config = CorrelationConfig(dependencies={**DEPS, "postgres": ["order-service"]})  # includes a cycle

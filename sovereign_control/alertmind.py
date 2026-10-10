@@ -31,7 +31,12 @@ _SEVERITY_ALIASES = {
     "medium": "medium", "warning": "medium", "warn": "medium", "minor": "medium", "p3": "medium",
     "low": "low", "info": "low", "informational": "low", "none": "low", "p4": "low", "p5": "low",
 }
-_SERVICE_LABELS = ("service", "app", "app_kubernetes_io_name", "application", "job")
+# Labels naming what the alert is about. `job` is deliberately absent: it names the scrape job
+# (e.g. "node-exporter"), which many unrelated hosts share. Host alerts fall back to `node`, then
+# the host part of `instance` (see _subject).
+_SERVICE_LABELS = ("service", "app", "app_kubernetes_io_name", "application")
+# Some setups send "back to normal" notifications as firing alerts with severity/state "Ok".
+_RECOVERY_WORDS = frozenset({"ok", "normal", "resolved", "recovered", "clear", "cleared"})
 _ENV_LABELS = ("environment", "env")
 _RANK = {s: i for i, s in enumerate(SEVERITIES)}
 
@@ -109,6 +114,24 @@ class IngestResult:
 # ---- normalization -------------------------------------------------------------
 
 
+def _subject(labels: dict[str, str]) -> str:
+    """The service or host an alert is about."""
+    found = _first(labels, _SERVICE_LABELS) or labels.get("node", "")
+    if not found and labels.get("instance"):
+        host = labels["instance"]
+        if host.startswith("["):  # [ipv6]:port
+            host = host[1:].split("]", 1)[0]
+        elif host.count(":") == 1:  # host:port
+            host = host.split(":", 1)[0]
+        found = host
+    return found
+
+
+def _is_recovery(status: Any, labels: dict[str, str]) -> bool:
+    return status == "resolved" or any(
+        labels.get(key, "").strip().lower() in _RECOVERY_WORDS for key in ("severity", "state"))
+
+
 def normalize_severity(value: Any) -> str:
     return _SEVERITY_ALIASES.get(str(value or "").strip().lower(), "medium")
 
@@ -143,15 +166,16 @@ def parse_alertmanager(payload: Any) -> list[Alert]:
         if not name:
             raise AlertError("alert is missing labels.alertname")
         status = raw.get("status", payload.get("status", "firing"))
+        subject = _subject(labels)
         alerts.append(Alert(
             name=name,
             source="alertmanager",
-            status="resolved" if status == "resolved" else "firing",
+            status="resolved" if _is_recovery(status, labels) else "firing",
             severity=normalize_severity(labels.get("severity")),
-            service=_first(labels, _SERVICE_LABELS),
+            service=subject,
             environment=_first(labels, _ENV_LABELS),
             summary=annotations.get("summary") or annotations.get("description", ""),
-            fingerprint=str(raw.get("fingerprint") or f"alertmanager:{name}:{_first(labels, _SERVICE_LABELS)}"),
+            fingerprint=str(raw.get("fingerprint") or f"alertmanager:{name}:{subject}"),
             labels=labels,
         ))
     return alerts
@@ -174,14 +198,16 @@ def parse_generic(payload: Any) -> list[Alert]:
             raise AlertError("alert.name is required")
         labels = _str_dict(raw.get("labels"), "labels")
         source = str(raw.get("source") or "generic")
-        service = str(raw.get("service") or _first(labels, _SERVICE_LABELS))
+        service = str(raw.get("service") or _subject(labels))
         status = raw.get("status", "firing")
         if status not in ("firing", "resolved"):
             raise AlertError("alert.status must be firing or resolved")
         alerts.append(Alert(
             name=name,
             source=source,
-            status=status,
+            status="resolved" if _is_recovery(status, {**labels, "severity": str(raw.get("severity") or
+                                                                            labels.get("severity", ""))})
+            else "firing",
             severity=normalize_severity(raw.get("severity")),
             service=service,
             environment=str(raw.get("environment") or _first(labels, _ENV_LABELS)),

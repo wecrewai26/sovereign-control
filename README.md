@@ -183,6 +183,11 @@ AlertMind(incidents, CorrelationConfig(
 ))
 ```
 
+What an alert is about comes from `service`, `app`, `app.kubernetes.io/name` or `application`, then `node`, then
+the host in `instance`. The scrape `job` label is not used, because one job (e.g. `node-exporter`) spans many hosts.
+Alerts whose `severity` or `state` is `Ok`, `normal`, `resolved` or `cleared` are treated as recoveries even when
+sent as firing, as some Alertmanager setups do for "back to normal" notifications; they never open incidents.
+
 So the spec's §22 example (database exhaustion, CPU, API timeout, queue backlog, pod restart) becomes a single incident.
 Severities from different tools (`P1`, `error`, `warning`, `info`, …) are mapped to low/medium/high/critical.
 

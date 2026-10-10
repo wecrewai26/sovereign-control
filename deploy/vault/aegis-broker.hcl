@@ -3,21 +3,27 @@
 # AEGIS may only *generate* the specific dynamic credentials its tools are mapped to,
 # and revoke leases. It cannot read static secrets, change Vault configuration, or
 # create tokens. Each role below (pod-restarter, dba, ...) should itself be scoped to
-# the least the tool needs, with a short max TTL, e.g.:
+# the least the tool needs, with a short max TTL. For the Kubernetes pack
+# (sovereign_control.tools.kubernetes), one role covering all five tools needs:
 #
-#   vault write kubernetes/roles/production-pod-restarter \
+#   vault write kubernetes/roles/production-remediation \
 #       allowed_kubernetes_namespaces="shop,payments" \
-#       generated_role_rules='{"rules":[{"apiGroups":[""],"resources":["pods"],"verbs":["get","list","delete"]}]}' \
-#       token_default_ttl=5m token_max_ttl=15m
+#       token_default_ttl=5m token_max_ttl=15m \
+#       generated_role_rules='{"rules":[
+#         {"apiGroups":[""],"resources":["pods"],"verbs":["get","list","delete"]},
+#         {"apiGroups":["apps"],"resources":["replicasets","statefulsets","daemonsets"],"verbs":["get","list"]},
+#         {"apiGroups":["apps"],"resources":["deployments"],"verbs":["get","patch","update"]}]}'
+#
+# or one role per tool, so a read-only tool's credential cannot delete anything.
 #
 # Attach this policy to the AppRole or Kubernetes auth role AEGIS logs in with:
 #   vault policy write aegis-broker deploy/vault/aegis-broker.hcl
 
 # Kubernetes secrets engine: short-lived service account tokens.
-path "kubernetes/creds/production-pod-restarter" {
+path "kubernetes/creds/production-remediation" {
   capabilities = ["update"]
 }
-path "kubernetes/creds/staging-pod-restarter" {
+path "kubernetes/creds/staging-remediation" {
   capabilities = ["update"]
 }
 

@@ -150,6 +150,16 @@ class PolicyRuleTests(unittest.TestCase):
         self.assertEqual(ex.policy.decision, Decision.ALLOW_WITH_APPROVAL)
         self.assertIn("rule:prod-restart-needs-approval", ex.policy.reasons)
 
+    def test_rule_can_target_only_changes(self):
+        gw = make_gateway(autonomy=AutonomyLevel.L5_CLOSED_LOOP)
+        gw.tools.register(make_tool("k8s.get_pods", mutating=False, required_permissions=frozenset()))
+        gw.agents.get("k8s-agent").tool_scopes |= {"k8s.get_pods"}
+        gw.policy.add_rule(PolicyRule("prod-changes", Decision.ALLOW_WITH_APPROVAL,
+                                      match={"environment": "production", "mutating": True}))
+        self.assertEqual(gw.request("k8s-agent", "k8s.get_pods", "production").status, ExecutionStatus.SUCCEEDED)
+        self.assertEqual(gw.request("k8s-agent", "k8s.restart_pod", "production").status,
+                         ExecutionStatus.PENDING_APPROVAL)
+
     def test_rules_cannot_loosen(self):
         gw = make_gateway(autonomy=AutonomyLevel.L3_APPROVED_EXECUTION)
         gw.policy.add_rule(PolicyRule("allow-all", Decision.ALLOW))

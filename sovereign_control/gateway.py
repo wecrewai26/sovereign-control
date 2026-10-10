@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import inspect
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -281,7 +282,7 @@ class SovereignGateway:
                 self.audit.record("verification.skipped", "verification-engine", eid)
                 return
 
-            execution.verified = self._verify(execution, tool.verifier)
+            execution.verified = self._verify(execution, tool.verifier, cred)
             if execution.verified:
                 execution.status = ExecutionStatus.SUCCEEDED
                 return
@@ -294,9 +295,12 @@ class SovereignGateway:
                 self.audit.record("credential.revoke_failed", "credential-broker", eid,
                                   error=f"{type(exc).__name__}: {exc}", expires_at=cred.expires_at.isoformat())
 
-    def _verify(self, execution: Execution, verifier) -> bool:
+    def _verify(self, execution: Execution, verifier, cred) -> bool:
         try:
-            ok = bool(verifier(execution.params, execution.result))
+            takes_credential = len(inspect.signature(verifier).parameters) >= 3
+            args = (execution.params, execution.result, cred) if takes_credential else (execution.params,
+                                                                                      execution.result)
+            ok = bool(verifier(*args))
         except Exception as exc:  # noqa: BLE001
             execution.notes.append(f"verifier raised {type(exc).__name__}: {exc}")
             ok = False

@@ -32,6 +32,7 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `alertmind.AlertMind` | §21, §22 | Alert ingestion (Alertmanager webhook, generic JSON), severity normalization, de-duplication, silences, noise threshold, and dependency-aware correlation into incidents |
 | `opsgraph.OpsGraph` | §33 | Service and infrastructure graph: what depends on what and what runs where. Feeds blast radius into risk and dependency chains into alert correlation |
 | `discovery.kubernetes` | §39 | Read-only Kubernetes discovery: workloads, nodes and placement, plus declared dependencies, reported into the OpsGraph |
+| `tools.kubernetes` | §31 | Real Kubernetes actions (list pods, restart pod, rolling restart, scale, roll back) with post-action verification and rollback |
 | `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
 
 ### HTTP API
@@ -263,6 +264,45 @@ The Vault role behind each path is the real permission boundary (which namespace
 [`deploy/vault/aegis-broker.hcl`](deploy/vault/aegis-broker.hcl) is a least-privilege policy for AEGIS's own Vault
 identity: it can generate those credentials and revoke leases, nothing else.
 
+### Kubernetes actions (§31)
+
+```python
+from sovereign_control.tools.kubernetes import KubeTarget, kubernetes_tools
+
+for tool in kubernetes_tools({"production": KubeTarget("https://k8s.prod:6443", ca_file="/etc/aegis/prod-ca.crt")},
+                             allowed_namespaces={"shop", "payments"}):
+    gw.tools.register(tool)
+```
+
+| Tool | Does | Verified by | Undo if verification fails |
+|---|---|---|---|
+| `k8s.get_pods` | List pods: phase, readiness, restarts, node | n/a (read-only) | n/a |
+| `k8s.restart_pod` | Delete a controller-managed pod so it's recreated | Old pod gone, controller fully ready | None; escalates to a person |
+| `k8s.rollout_restart` | Rolling restart of a Deployment | Rollout completes | None; escalates |
+| `k8s.scale` | Set a Deployment's replicas | That many replicas available | Scale back to the previous count |
+| `k8s.rollout_undo` | Go back to the previous (or a named) revision | Rollout completes | Return to the revision it replaced |
+
+Each call uses the short-lived token from the execution's credential (`cred.secret["service_account_token"]`, as
+Vault's Kubernetes secrets engine issues it), so the tools hold no standing cluster access. Map them in Vault with
+`VaultCredentialSpec("kubernetes/creds/{environment}-remediation", data={"kubernetes_namespace": "{param:namespace}"})`;
+[`deploy/vault/aegis-broker.hcl`](deploy/vault/aegis-broker.hcl) lists the exact Kubernetes permissions they need.
+
+Built-in guards, on top of policy, approval and the Vault role:
+- Only namespaces in `allowed_namespaces`; names must be valid Kubernetes names.
+- A pod with no controller is never deleted, since nothing would bring it back.
+- Scaling to zero is refused unless `allow_scale_to_zero`; replicas are capped by `max_replicas`.
+- Updates carry the object's `resourceVersion`, so if someone else changed it in the meantime the action fails with
+  a conflict instead of overwriting their change. Pod deletion is pinned to the pod's UID.
+- Pod templates, which can hold secrets in environment variables, are never copied into results or the audit trail;
+  rollbacks refer to revision numbers.
+
+`PYTHONPATH=. python3 examples/kubernetes_incident.py` runs the spec's §24 incident end to end through the API
+against an in-memory cluster: alert → incident → investigation → rollback proposal → approval → credential →
+rollback → verification → resolution → verified evidence bundle.
+
+Policy rules can match `"mutating": True` so that, for example, "production changes need approval" doesn't also
+gate read-only lookups.
+
 ### Autonomy levels (§4.5)
 
 | Level | Mutating tools |
@@ -314,6 +354,8 @@ gw.audit.verify()  # True
 This is the in-process core. Next steps toward the spec:
 - Keycloak/OIDC authenticator for human identity (§48) and OPA/Rego as a policy backend (§49)
 - TLS termination (put the API behind a reverse proxy until then)
+- Running executions off the request path: verification can wait minutes for a rollout, and today the API
+  handles one governance operation at a time, so other requests wait meanwhile
 - Signing or external anchoring of the audit chain: the hash chain catches partial edits, but someone with write
   access to the database could rebuild the whole chain
 - Metrics, logs, traces and topology in evidence bundles, once telemetry sources exist (§27, §42)

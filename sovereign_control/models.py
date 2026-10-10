@@ -76,7 +76,9 @@ class ApprovalMode(str, enum.Enum):
 
 
 ToolHandler = Callable[[dict[str, Any], "Credential"], Any]
-Verifier = Callable[[dict[str, Any], Any], bool]
+# A verifier may take the execution's credential as a third argument when checking the
+# result needs access to the system (e.g. reading back a Kubernetes rollout's status).
+Verifier = Callable[..., bool]
 RollbackHandler = Callable[[dict[str, Any], Any, "Credential"], Any]
 
 

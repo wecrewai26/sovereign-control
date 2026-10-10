@@ -26,7 +26,9 @@ from .risk import RiskAssessment
 class PolicyRule:
     """Declarative rule. Each `match` key must equal (or be contained in) the request attribute.
 
-    Supported keys: role, environment, tool_id, severity, service, risk_level, min_risk_level.
+    Supported keys: role, environment, tool_id, mutating, severity, service, risk_level, min_risk_level.
+    Use {"mutating": True} to target only tools that change something (e.g. "production changes
+    need approval" without also gating read-only lookups).
     """
 
     name: str
@@ -81,6 +83,7 @@ class PolicyEngine:
             "role": agent.role,
             "environment": environment,
             "tool_id": tool.tool_id,
+            "mutating": tool.mutating,
             "severity": ctx.severity,
             "service": ctx.service,
             "risk_level": risk.level,

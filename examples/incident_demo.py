@@ -60,7 +60,8 @@ gw.agents.issue(
     max_risk=RiskLevel.HIGH,
 )
 gw.policy.add_rule(
-    PolicyRule("prod-changes-need-approval", Decision.ALLOW_WITH_APPROVAL, match={"environment": "production"})
+    PolicyRule("prod-changes-need-approval", Decision.ALLOW_WITH_APPROVAL,
+               match={"environment": "production", "mutating": True})
 )
 
 execution = gw.request(

@@ -62,7 +62,7 @@ if "k8s-agent" not in {a.agent_id for a in gw.agents.all()}:  # already stored o
         autonomy=AutonomyLevel.L4_POLICY_AUTONOMOUS, max_risk=RiskLevel.HIGH,
     )
 gw.policy.add_rule(PolicyRule("prod-changes-need-approval", Decision.ALLOW_WITH_APPROVAL,
-                              match={"environment": "production"}))
+                              match={"environment": "production", "mutating": True}))
 
 auth = TokenAuthenticator(store)
 agent_token = auth.add_agent("k8s-agent")

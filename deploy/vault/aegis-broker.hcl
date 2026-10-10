@@ -16,6 +16,19 @@
 #
 # or one role per tool, so a read-only tool's credential cannot delete anything.
 #
+# The Control Tower's cluster pages request credentials for the pseudo-tool "k8s.read".
+# Give that its own read-only role (note pods/log, and no write verbs at all):
+#
+#   vault write kubernetes/roles/production-viewer \
+#       allowed_kubernetes_namespaces="shop,payments" \
+#       token_default_ttl=2m token_max_ttl=5m \
+#       generated_role_rules='{"rules":[
+#         {"apiGroups":[""],"resources":["pods","pods/log","events"],"verbs":["get","list"]},
+#         {"apiGroups":["apps"],"resources":["deployments","replicasets"],"verbs":["get","list"]}]}'
+#
+# and map it: VaultCredentialSpec("kubernetes/creds/{environment}-viewer",
+#                                 data={"kubernetes_namespace": "{param:namespace}"})
+#
 # Attach this policy to the AppRole or Kubernetes auth role AEGIS logs in with:
 #   vault policy write aegis-broker deploy/vault/aegis-broker.hcl
 
@@ -24,6 +37,10 @@ path "kubernetes/creds/production-remediation" {
   capabilities = ["update"]
 }
 path "kubernetes/creds/staging-remediation" {
+  capabilities = ["update"]
+}
+
+path "kubernetes/creds/production-viewer" {
   capabilities = ["update"]
 }
 

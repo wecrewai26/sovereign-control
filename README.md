@@ -33,6 +33,8 @@ Agent → Tool Registry → Risk Engine → Policy Engine → Approval Engine
 | `opsgraph.OpsGraph` | §33 | Service and infrastructure graph: what depends on what and what runs where. Feeds blast radius into risk and dependency chains into alert correlation |
 | `discovery.kubernetes` | §39 | Read-only Kubernetes discovery: workloads, nodes and placement, plus declared dependencies, reported into the OpsGraph |
 | `tools.kubernetes` | §31 | Real Kubernetes actions (list pods, restart pod, rolling restart, scale, roll back) with post-action verification and rollback |
+| `clusters.ClusterViewer` | §42, §43 | Live, read-only cluster views (pods like Lens, deployments, events, logs) and Prometheus CPU/memory history |
+| `web` | §43, §54 | The Control Tower web page at `/ui`: overview, approvals with evidence, incidents with timelines, clusters |
 | `auth.TokenAuthenticator` | §48 | Bearer tokens for users and agents, stored hashed; swappable for Keycloak/OIDC |
 
 ### HTTP API
@@ -61,6 +63,12 @@ agent, and an integration token (for Alertmanager and similar) can only push ale
 | PUT | `/v1/opsgraph` | user with `admin` | Replace the graph (validated first; audited with its fingerprint; persisted) |
 | POST | `/v1/ingest/opsgraph` | integration (approved sources only) | Discovery report, merged under the source's name |
 | GET | `/v1/opsgraph/{id}/impact`, `/v1/agent/opsgraph/{id}/impact` | user, agent | What fails if this fails, what it depends on, which customer-facing services are reached |
+| GET | `/v1/me` | user | The signed-in user's id and roles |
+| GET | `/v1/clusters` | user | Configured clusters, their viewable namespaces, and whether metrics are available |
+| GET | `/v1/clusters/{env}/namespaces/{ns}/pods`, `/deployments`, `/events` | user | Live views (audited) |
+| GET | `/v1/clusters/{env}/namespaces/{ns}/pods/{pod}/logs?container=&tail=` | user | Pod logs, secrets redacted (audited) |
+| GET | `/v1/clusters/{env}/namespaces/{ns}/pods/{pod}/metrics?minutes=` | user | CPU and memory history from Prometheus |
+| GET | `/ui` | anyone | The Control Tower page (it asks for a user token; all data comes from the endpoints above) |
 | GET, POST | `/v1/silences` | user | List or add a silence `{name, match: {label: value}, duration_minutes}` |
 | POST | `/v1/agent/incidents` | agent | Open an incident (`detection_source` is recorded as the agent) |
 | GET | `/v1/agent/incidents/{id}` | agent | Incident with timeline |
@@ -307,6 +315,51 @@ rollback → verification → resolution → verified evidence bundle.
 
 Policy rules can match `"mutating": True` so that, for example, "production changes need approval" doesn't also
 gate read-only lookups.
+
+### Control Tower web page (§43, §54)
+
+```bash
+PYTHONPATH=. python3 examples/control_tower_demo.py     # then open http://127.0.0.1:8080/ui
+```
+
+The demo runs against an in-memory cluster and Prometheus. To show your own clusters:
+
+```python
+from sovereign_control.clusters import ClusterConfig, ClusterViewer, PrometheusTarget
+from sovereign_control.tools.kubernetes import KubeTarget
+
+viewer = ClusterViewer(gw, {
+    "production": ClusterConfig(KubeTarget("https://k8s.prod:6443", ca_file="/etc/aegis/prod-ca.crt"),
+                                namespaces={"shop", "monitoring"},
+                                prometheus=PrometheusTarget("http://prometheus.monitoring:9090")),
+})
+api = ControlAPI(gw, auth, clusters=viewer)   # gw uses VaultCredentialBroker with a "k8s.read" mapping
+```
+
+- **Overview:** pending approvals, open incidents by severity, active agents, blocked actions, escalations, and
+  whether the audit chain verifies.
+- **Approvals:** each request shows the risk score and its reasons, the OpsGraph notes, the agent's hypothesis,
+  confidence and evidence, with approve (as one of your roles) and reject.
+- **Incidents:** list, timeline and evidence-bundle download.
+- **Clusters:** a pods table like Lens (containers, restarts, CPU, memory, controller, node, QoS, age, status),
+  deployments and events per namespace. Selecting a pod shows its CPU and memory over 15 minutes to 24 hours
+  and its logs.
+
+How the page is governed:
+- **Read-only, short-lived access.** Each cluster load asks the credential broker for a `k8s.read` credential (map it
+  to a get/list/log-only Vault role; see `deploy/vault/aegis-broker.hcl`) and revokes it straight after. Only the
+  namespaces you list can be viewed.
+- **Audited.** Who viewed which pods, deployments, events and logs is recorded. CPU and memory numbers are not, to
+  keep the trail readable.
+- **Logs are scrubbed.** Passwords in URLs, bearer tokens, JWTs, `password=`/`api_key:` values, AWS keys and private
+  keys are replaced with `[REDACTED]`, and the page says how many were hidden. This catches common shapes; it is a
+  safety net, not a guarantee.
+- **Prometheus queries can't be injected.** Namespace and pod names are validated before they go into PromQL.
+- **The page itself.** It is served with a strict Content-Security-Policy (same-origin only, no inline script, no
+  framing), keeps the token in this tab's sessionStorage only, and renders every value as text, never as markup.
+  Cluster reads don't hold the governance lock, so a slow cluster doesn't stall approvals.
+
+Manual refresh only: nothing polls the cluster in the background.
 
 ### Autonomy levels (§4.5)
 

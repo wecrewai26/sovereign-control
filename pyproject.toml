@@ -10,5 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
-[tool.setuptools]
-packages = ["sovereign_control"]
+[tool.setuptools.packages.find]
+include = ["sovereign_control*"]
+
+[tool.setuptools.package-data]
+"sovereign_control.web" = ["*.html", "*.js", "*.css"]

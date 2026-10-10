@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AEGIS Control Tower</title>
+  <link rel="stylesheet" href="/ui/app.css">
+  <script type="module" src="/ui/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">◆</span> AEGIS <span class="muted">Control Tower</span></div>
+    <div class="topbar-right">
+      <span id="whoami" class="muted"></span>
+      <button id="theme" class="ghost" type="button" aria-label="Switch light or dark theme">Theme</button>
+      <button id="signout" class="ghost" type="button" hidden>Sign out</button>
+    </div>
+  </header>
+
+  <section id="signin" class="signin" hidden>
+    <h1>Sign in</h1>
+    <p class="muted">Paste your AEGIS user token. It is kept only for this browser tab.</p>
+    <form id="signin-form">
+      <label for="token">Token</label>
+      <input id="token" type="password" autocomplete="off" required>
+      <button type="submit">Sign in</button>
+      <p id="signin-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <div id="app" class="layout" hidden>
+    <nav class="nav" aria-label="Sections">
+      <button data-view="tower" class="nav-item">Overview</button>
+      <button data-view="approvals" class="nav-item">Approvals <span id="badge-approvals" class="badge" hidden></span></button>
+      <button data-view="incidents" class="nav-item">Incidents <span id="badge-incidents" class="badge" hidden></span></button>
+      <button data-view="cluster" class="nav-item">Clusters</button>
+    </nav>
+    <main id="main" class="main" tabindex="-1"></main>
+  </div>
+</body>
+</html>

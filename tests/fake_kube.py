@@ -42,6 +42,8 @@ class Cluster:
         self.capacity = 100  # pods the cluster can run per deployment
         self.concurrent_writer = False
         self.deleted = []
+        self.events = {}
+        self.logs = {}  # (ns, pod) -> text
 
     def uid(self):
         return f"uid-{next(self.ids)}"
@@ -59,8 +61,27 @@ class Cluster:
         return d
 
     def add_bare_pod(self, ns, name):
-        self.pods[(ns, name)] = {"metadata": {"name": name, "namespace": ns, "uid": self.uid()},
-                                 "spec": {"nodeName": "node-1"}, "status": {"phase": "Running"}}
+        self.pods[(ns, name)] = {"metadata": {"name": name, "namespace": ns, "uid": self.uid(),
+                                              "creationTimestamp": "2026-10-01T00:00:00Z"},
+                                 "spec": {"nodeName": "node-1", "containers": [{"name": name}]},
+                                 "status": {"phase": "Running", "qosClass": "BestEffort", "containerStatuses": [
+                                     {"name": name, "ready": True, "restartCount": 0, "state": {"running": {}}}]}}
+
+    def evict(self, ns, name):
+        pod = self.pods[(ns, name)]
+        pod["status"].update(phase="Failed", reason="Evicted",
+                             message="The node was low on resource: memory. Container x was using 2Gi.")
+        for c in pod["status"]["containerStatuses"]:
+            c.update(ready=False, state={"terminated": {"reason": "Error"}})
+
+    def crashloop(self, ns, name, restarts=7):
+        for c in self.pods[(ns, name)]["status"]["containerStatuses"]:
+            c.update(ready=False, restartCount=restarts, state={"waiting": {"reason": "CrashLoopBackOff"}})
+
+    def add_event(self, ns, name, kind, obj, reason, message, type_="Warning", count=1):
+        self.events[(ns, name)] = {"metadata": {"name": name, "namespace": ns}, "type": type_, "reason": reason,
+                                   "message": message, "count": count, "lastTimestamp": "2026-10-10T09:00:00Z",
+                                   "involvedObject": {"kind": kind, "name": obj}}
 
     @staticmethod
     def _template(name, image):
@@ -116,11 +137,15 @@ class Cluster:
     def _new_pod(self, rs, ready=True):
         name = f"{rs['metadata']['name']}-{next(self.ids)}"
         ns = rs["metadata"]["namespace"]
+        app = rs["metadata"]["ownerReferences"][0]["name"]
         self.pods[(ns, name)] = {
             "metadata": {"name": name, "namespace": ns, "uid": self.uid(), "labels": {"app": rs["metadata"]["name"]},
+                         "creationTimestamp": "2026-10-01T00:00:00Z",
                          "ownerReferences": [{"kind": "ReplicaSet", "name": rs["metadata"]["name"], "controller": True}]},
-            "spec": {"nodeName": "node-1"},
-            "status": {"phase": "Running", "containerStatuses": [{"ready": ready, "restartCount": 0}]}}
+            "spec": {"nodeName": "node-1", "containers": [{"name": app}]},
+            "status": {"phase": "Running", "qosClass": "Burstable", "containerStatuses": [
+                {"name": app, "ready": ready, "restartCount": 0,
+                 "state": {"running": {}} if ready else {"waiting": {"reason": "CrashLoopBackOff"}}}]}}
 
     def refresh_status(self, d):
         """Recount ready pods, as the Deployment controller does after pods change."""
@@ -181,7 +206,20 @@ class Handler(BaseHTTPRequestHandler):
             offset = 2 if parts[0] == "api" else 3
             ns, kind = parts[offset + 1], parts[offset + 2]
             name = parts[offset + 3] if len(parts) > offset + 3 else None
-            store = {"pods": c.pods, "replicasets": c.replicasets, "deployments": c.deployments}.get(kind)
+            sub = parts[offset + 4] if len(parts) > offset + 4 else None
+            if kind == "pods" and sub == "log" and self.command == "GET":
+                if (ns, name) not in c.pods:
+                    return self._reply(404, {"message": f'pods "{name}" not found'})
+                tail = int(parse_qs(url.query).get("tailLines", ["200"])[0])
+                text = "\n".join(c.logs.get((ns, name), "").splitlines()[-tail:]).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(text)))
+                self.end_headers()
+                self.wfile.write(text)
+                return
+            store = {"pods": c.pods, "replicasets": c.replicasets, "deployments": c.deployments,
+                     "events": c.events}.get(kind)
             if store is None:
                 return self._reply(404, {"message": f"unknown resource {kind}"})
             if name is None and self.command == "GET":

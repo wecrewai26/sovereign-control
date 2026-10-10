@@ -65,8 +65,9 @@ class KubeAPI:
         self._token = token
         self._ssl = ssl.create_default_context(cafile=target.ca_file) if target.server.startswith("https") else None
 
-    def request(self, method: str, path: str, body: Any = None, content_type: str = "application/json") -> Any:
-        headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
+    def request(self, method: str, path: str, body: Any = None, content_type: str = "application/json",
+                *, text: bool = False) -> Any:
+        headers = {"Authorization": f"Bearer {self._token}", "Accept": "text/plain" if text else "application/json"}
         data = None
         if body is not None:
             data = json.dumps(body).encode()
@@ -84,10 +85,15 @@ class KubeAPI:
             raise KubeError(f"{method} {path}: HTTP {exc.code}{' ' + message if message else ''}") from None
         except urllib.error.URLError as exc:
             raise KubeError(f"Kubernetes API unreachable: {exc.reason}") from None
+        if text:
+            return raw.decode("utf-8", errors="replace")
         return json.loads(raw) if raw else {}
 
     def get(self, path: str) -> Any:
         return self.request("GET", path)
+
+    def get_text(self, path: str) -> str:
+        return self.request("GET", path, text=True)
 
 
 def kubernetes_tools(

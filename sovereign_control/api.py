@@ -10,6 +10,7 @@ status and JSON out) so it can be tested directly and mounted behind any server.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
@@ -22,6 +23,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from . import serialize
 from .alertmind import AlertError, AlertMind, CorrelationConfig, Silence, parse_alertmanager, parse_generic
 from .approval import ApprovalError
+from .clusters import ClusterViewError, ClusterViewer
+from .web import WEB_ASSETS, WEB_SECURITY_HEADERS
 from .evidence import EvidenceError, build_bundle
 from .incidents import (
     AGENT_SETTABLE,
@@ -51,7 +54,8 @@ class HTTPError(Exception):
 class FileResponse:
     """A non-JSON response body, sent as a download."""
 
-    def __init__(self, content: bytes, content_type: str, filename: str, headers: dict[str, str] | None = None):
+    def __init__(self, content: bytes, content_type: str, filename: str | None,
+                 headers: dict[str, str] | None = None):
         self.content = content
         self.content_type = content_type
         self.filename = filename
@@ -94,17 +98,21 @@ class ControlAPI:
         incidents: IncidentManager | None = None,
         alertmind: AlertMind | None = None,
         graph_sources: set[str] | None = None,
+        clusters: ClusterViewer | None = None,
     ) -> None:
         self.gateway = gateway
         self.incidents = incidents or IncidentManager(gateway)
         self.alertmind = alertmind or AlertMind(self.incidents, CorrelationConfig(graph=gateway.graph))
         # Integrations allowed to report OpsGraph entries (by integration name). Others can only push alerts.
         self.graph_sources = set(graph_sources or ())
+        self.clusters = clusters
+        if clusters is not None:
+            clusters._guard = lambda: self._lock
         self.auth = authenticator
         self.evidence_signing_key = evidence_signing_key
         # The governance core is not thread-safe; serialize access to it.
         self._lock = threading.Lock()
-        self._routes: list[tuple[str, re.Pattern[str], PrincipalKind, Handler]] = []
+        self._routes: list[tuple[str, re.Pattern[str], PrincipalKind, Handler, bool]] = []
 
         agent, user, integration = PrincipalKind.AGENT, PrincipalKind.USER, PrincipalKind.INTEGRATION
         self._route("POST", "/v1/ingest/alertmanager", integration, self.ingest_alertmanager)
@@ -119,6 +127,7 @@ class ControlAPI:
         self._route("POST", "/v1/agent/incidents/{id}/alerts", agent, self.attach_alert)
         self._route("POST", "/v1/agent/incidents/{id}/status", agent, self.agent_incident_status)
 
+        self._route("GET", "/v1/me", user, self.me)
         self._route("GET", "/v1/tools", user, self.list_tools)
         self._route("GET", "/v1/agents", user, self.list_agents)
         self._route("POST", "/v1/agents/{id}/disable", user, self.disable_agent)
@@ -142,14 +151,25 @@ class ControlAPI:
         self._route("GET", "/v1/opsgraph", user, self.get_graph)
         self._route("PUT", "/v1/opsgraph", user, self.put_graph)
         self._route("GET", "/v1/opsgraph/{id}/impact", user, self.graph_impact)
+        self._route("GET", "/v1/clusters", user, self.list_clusters)
+        for resource in ("pods", "deployments", "events"):
+            self._route("GET", "/v1/clusters/{env}/namespaces/{ns}/" + resource, user,
+                        self._cluster_view(resource), exclusive=False)
+        self._route("GET", "/v1/clusters/{env}/namespaces/{ns}/pods/{pod}/logs", user, self.pod_logs,
+                    exclusive=False)
+        self._route("GET", "/v1/clusters/{env}/namespaces/{ns}/pods/{pod}/metrics", user, self.pod_metrics,
+                    exclusive=False)
         self._route("GET", "/v1/silences", user, self.list_silences)
         self._route("POST", "/v1/silences", user, self.add_silence)
 
-    def _route(self, method: str, template: str, kind: PrincipalKind, handler: Handler) -> None:
+    def _route(self, method: str, template: str, kind: PrincipalKind, handler: Handler,
+               exclusive: bool = True) -> None:
+        """`exclusive` handlers run holding the governance lock. Cluster views don't: they wait on
+        remote clusters and take the lock themselves only around shared state."""
         # A path parameter is one URL segment; ids containing "/" (e.g. "node/ip-10-0-1-7") are sent
         # URL-encoded ("node%2Fip-10-0-1-7") and decoded before the handler sees them.
         pattern = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[A-Za-z0-9_.:%-]+)", template) + "$")
-        self._routes.append((method, pattern, kind, handler))
+        self._routes.append((method, pattern, kind, handler, exclusive))
 
     def handle(self, method: str, target: str, headers: dict[str, str], body: bytes = b"") -> Response:
         try:
@@ -163,9 +183,13 @@ class ControlAPI:
         url = urlsplit(target)
         if url.path == "/healthz" and method == "GET":
             return {"status": "ok"}
+        if method == "GET" and url.path in WEB_ASSETS:
+            # The page itself is public; every call it makes needs a token.
+            content, content_type = WEB_ASSETS[url.path]
+            return FileResponse(content, content_type, None, dict(WEB_SECURITY_HEADERS))
 
         matched_path = False
-        for route_method, pattern, kind, handler in self._routes:
+        for route_method, pattern, kind, handler, exclusive in self._routes:
             m = pattern.match(url.path)
             if not m:
                 continue
@@ -177,9 +201,11 @@ class ControlAPI:
                 raise HTTPError(403, f"endpoint requires a {kind.value} credential")
             params = {k: unquote(v) for k, v in m.groupdict().items()}
             request = Request(principal, params, parse_qs(url.query), body)
-            with self._lock:
+            with self._lock if exclusive else contextlib.nullcontext():
                 try:
                     return handler(request)
+                except ClusterViewError as exc:
+                    raise HTTPError(exc.status, str(exc)) from None
                 except RegistryError as exc:
                     raise HTTPError(404, str(exc.args[0])) from None
                 except ApprovalError as exc:
@@ -241,6 +267,9 @@ class ControlAPI:
         return serialize.agent(self.gateway.agents.get(req.principal.id))
 
     # ---- Human API ----------------------------------------------------------
+
+    def me(self, req: Request) -> Any:
+        return {"id": req.principal.id, "roles": sorted(req.principal.roles)}
 
     def list_tools(self, req: Request) -> Any:
         return {"tools": [serialize.tool(t) for t in self.gateway.tools.all()]}
@@ -336,6 +365,31 @@ class ControlAPI:
             raise HTTPError(404 if str(exc).startswith("unknown") else 400, str(exc)) from None
         return FileResponse(bundle.content, "application/zip", bundle.filename,
                             {"X-Evidence-SHA256": bundle.sha256, "X-Evidence-Bundle-Id": bundle.bundle_id})
+
+    # ---- Cluster views (§42, §43) ------------------------------------------------
+
+    def _viewer(self) -> ClusterViewer:
+        if self.clusters is None:
+            raise HTTPError(404, "no clusters are configured")
+        return self.clusters
+
+    def list_clusters(self, req: Request) -> Any:
+        return {"clusters": self.clusters.list_clusters() if self.clusters else []}
+
+    def _cluster_view(self, resource: str) -> Handler:
+        def handler(req: Request) -> Any:
+            view = getattr(self._viewer(), resource)
+            return view(req.principal.id, req.params["env"], req.params["ns"])
+        return handler
+
+    def pod_logs(self, req: Request) -> Any:
+        tail = _int_param(req.q("tail"), 200)
+        return self._viewer().logs(req.principal.id, req.params["env"], req.params["ns"], req.params["pod"],
+                                   container=req.q("container"), tail=tail)
+
+    def pod_metrics(self, req: Request) -> Any:
+        return self._viewer().pod_metrics(req.params["env"], req.params["ns"], req.params["pod"],
+                                          minutes=_int_param(req.q("minutes"), 60))
 
     # ---- OpsGraph (§33) ---------------------------------------------------------
 
@@ -482,6 +536,15 @@ class ControlAPI:
             raise HTTPError(404, "execution not found") from None
 
 
+def _int_param(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise HTTPError(400, f"expected a whole number, got {value!r}") from None
+
+
 def _make_handler(api: ControlAPI) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "SovereignControl/0.1"
@@ -496,7 +559,9 @@ def _make_handler(api: ControlAPI) -> type[BaseHTTPRequestHandler]:
             extra: dict[str, str] = {}
             if isinstance(payload, FileResponse):
                 data, content_type = payload.content, payload.content_type
-                extra = {"Content-Disposition": f'attachment; filename="{payload.filename}"', **payload.headers}
+                extra = dict(payload.headers)
+                if payload.filename:
+                    extra["Content-Disposition"] = f'attachment; filename="{payload.filename}"'
             else:
                 data, content_type = json.dumps(payload, default=str).encode(), "application/json"
             self.send_response(status)
